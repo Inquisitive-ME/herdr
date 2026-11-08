@@ -22,6 +22,25 @@ The patches in `patches/`:
 4. **Needs input under the list.** The needs-input section sits right under the
    spaces list and moves with it, dropping to the bottom only when the list is too
    long to leave room.
+5. **State times and pane moves (server).** Agents carry a `state_since_ms` token
+   with when their current state began, and clients may call `pane.move`. This
+   changes the server, so a running server needs a restart or
+   `herdr server live-handoff --import-exe <new herdr>` (keeps agents running) to
+   pick it up. Older servers just show no ages and refuse cross-space drags.
+6. **Organized space tree.**
+   - The ▾ at the right of a space collapses it to one summary row of status
+     counts (`●2 ✓1 ›2`); clicking the summary expands it again.
+   - Plain terminals are listed dimmed (`› backend`). Right-click a space and choose
+     Hide terminals to hide them there.
+   - A pane working outside its space's home folder (the first tab's) gets a
+     `↳ subdir` line.
+   - Agent lines show how long they've been in their state (`12m`, `3h`, `2d`).
+   - Drag a line onto another space to move it there as a new tab, or onto a line
+     in the same space to reorder tabs. Right-click a line to rename its tab, move
+     it to another or a new space, or close it. Clicking still jumps to it.
+   - `keys.next_agent` / `previous_agent` cycle the agents needing input (all agents
+     when none do), and `keys.focus_agent` follows the tree order, which shows the
+     numbers 1-9 beside agents while it's bound.
 
 Builds: Linux x86_64, Linux ARM (aarch64) and Apple Silicon macOS. There are no
 Windows or Intel Mac builds; use upstream herdr there.
@@ -39,9 +58,12 @@ if none exists. Set `HERDR_INSTALL_DIR` to choose another directory.
 Options go after `sh -s --` when piping, e.g. `... | sh -s -- --with-shell-count`:
 
 - `--with-shell-count` also installs the [shell-count watcher](extras/shell-count).
-  Once it's installed, later installs update it too.
+- `--with-asking` also installs [Claude Code hooks](extras/claude-asking) that show
+  what a waiting agent is asking (`Bash: docker compose up`) in the needs-input
+  section.
+- Once an extra is installed, later installs update it too.
 - `--uninstall` lists what it will do, asks, then removes herdr's agent integrations
-  (such as the Claude hooks), the shell-count watcher, stops running herdr sessions
+  (such as the Claude hooks), the extras above, stops running herdr sessions
   (closing their panes and agents) and deletes the herdr binary. Run it outside
   herdr. Add `--purge` to also delete `~/.config/herdr` (config, saved sessions,
   logs) and `--yes` to skip the question.

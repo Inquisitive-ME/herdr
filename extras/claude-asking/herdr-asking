@@ -1,0 +1,129 @@
+#!/bin/sh
+# Show what a waiting Claude Code agent is asking in herdr's "needs input" section,
+# e.g. "Bash: docker compose up", through the agent pane's `asking` token.
+#
+#   herdr-asking install    add the hooks below to Claude Code's settings.json
+#   herdr-asking uninstall  remove them and this script
+#
+# Claude Code runs these hooks:
+#   herdr-asking ask    on PermissionRequest (also fires for questions and plan approval)
+#   herdr-asking clear  on PostToolUse, UserPromptSubmit and Stop; a no-op unless an
+#                       `ask` set the token, so it costs one file check per tool call
+set -u
+
+SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+SELF="$HOME/.local/bin/herdr-asking"
+
+manage_hooks() { # add|remove
+    command -v python3 >/dev/null 2>&1 || { echo "herdr-asking needs python3" >&2; exit 1; }
+    python3 - "$1" "$SETTINGS" "$SELF" <<'PY'
+import json, os, shutil, sys
+
+action, path, script = sys.argv[1:]
+events = {"PermissionRequest": "ask", "PostToolUse": "clear",
+          "UserPromptSubmit": "clear", "Stop": "clear"}
+try:
+    with open(path) as f:
+        settings = json.load(f)
+except FileNotFoundError:
+    if action == "remove":
+        sys.exit(0)
+    settings = {}
+hooks = settings.setdefault("hooks", {})
+
+def ours(group):
+    return any("herdr-asking" in hook.get("command", "") for hook in group.get("hooks", []))
+
+for event in events:
+    groups = [group for group in hooks.get(event, []) if not ours(group)]
+    if action == "add":
+        command = f"'{script}' {events[event]}"
+        groups.append({"hooks": [{"type": "command", "command": command, "timeout": 5}]})
+    if groups:
+        hooks[event] = groups
+    else:
+        hooks.pop(event, None)
+if not hooks:
+    settings.pop("hooks")
+if os.path.exists(path):
+    shutil.copy2(path, path + ".bak-herdr-asking")
+os.makedirs(os.path.dirname(path), exist_ok=True)
+tmp = path + ".tmp-herdr-asking"
+with open(tmp, "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+os.replace(tmp, path)
+PY
+}
+
+case "${1:-}" in
+    install)
+        manage_hooks add || exit 1
+        echo "herdr-asking hooks added to $SETTINGS (new Claude sessions pick them up)"
+        exit 0
+        ;;
+    uninstall)
+        manage_hooks remove || exit 1
+        rm -f "$SELF"
+        echo "herdr-asking removed"
+        exit 0
+        ;;
+esac
+
+# Hooks: only act inside a herdr pane, and never fail or print (that would steer Claude).
+if [ "${HERDR_ENV:-}" != 1 ] || [ -z "${HERDR_PANE_ID:-}" ]; then
+    cat >/dev/null
+    exit 0
+fi
+herdr=${HERDR_BIN_PATH:-herdr}
+dir="${TMPDIR:-/tmp}/herdr-asking-$(id -u)"
+marker="$dir/$(printf '%s' "${HERDR_SOCKET_PATH:-}|$HERDR_PANE_ID" | cksum | cut -d' ' -f1)"
+
+case "${1:-}" in
+    ask)
+        text=$(python3 -c '
+import json, os, sys
+event = json.load(sys.stdin)
+tool = event.get("tool_name") or "tool"
+args = event.get("tool_input") or {}
+cwd = (event.get("cwd") or "").rstrip("/")
+home = os.path.expanduser("~")
+
+def short(path):
+    if cwd and path.startswith(cwd + "/"):
+        return path[len(cwd) + 1:]
+    if path.startswith(home + "/"):
+        return "~" + path[len(home):]
+    return path
+
+if tool == "AskUserQuestion":
+    questions = args.get("questions") or [{}]
+    text = "Question: " + str(questions[0].get("question", ""))
+elif tool == "ExitPlanMode":
+    text = "Approve plan"
+elif args.get("command"):
+    text = tool + ": " + str(args["command"])
+elif args.get("file_path") or args.get("notebook_path"):
+    text = tool + ": " + short(str(args.get("file_path") or args.get("notebook_path")))
+else:
+    detail = next((value for value in args.values() if isinstance(value, str) and value.strip()), "")
+    text = tool + ": " + detail if detail else tool
+print(" ".join(text.split())[:80])
+' 2>/dev/null) || exit 0
+        [ -n "$text" ] || exit 0
+        mkdir -p "$dir" 2>/dev/null && : >"$marker"
+        "$herdr" pane report-metadata "$HERDR_PANE_ID" --source herdr-asking \
+            --token "asking=$text" >/dev/null 2>&1
+        ;;
+    clear)
+        cat >/dev/null
+        [ -e "$marker" ] || exit 0
+        rm -f "$marker"
+        "$herdr" pane report-metadata "$HERDR_PANE_ID" --source herdr-asking \
+            --clear-token asking >/dev/null 2>&1
+        ;;
+    *)
+        cat >/dev/null
+        ;;
+esac
+exit 0

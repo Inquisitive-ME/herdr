@@ -47,6 +47,8 @@ done
 case "$url" in
     */extras/shell-count/install.sh)
         printf '#!/bin/sh\\necho "watcher installed with herdr at $(command -v herdr)" >> "$FAKE_LOG"\\n' > "$out" ;;
+    */extras/claude-asking/install.sh)
+        printf '#!/bin/sh\\necho "asking hooks installed" >> "$FAKE_LOG"\\n' > "$out" ;;
     */extras/*) echo "extra file" > "$out" ;;
     *) if [ -n "$out" ]; then cp "$FAKE_PAYLOAD" "$out"; else cat "$FAKE_MANIFEST"; fi ;;
 esac
@@ -186,6 +188,32 @@ esac
             self.assertFalse(path.exists())
         self.assertTrue(config.exists(), "config is kept without --purge")
         self.assertIn("--purge", result.stdout)
+
+    def test_with_asking_installs_and_later_runs_update_the_hooks(self):
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("asking hooks installed", self.calls())
+        result = self.run_installer("--with-asking")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("asking hooks installed", self.calls())
+        asking = self.home / ".local/bin/herdr-asking"
+        asking.parent.mkdir(parents=True, exist_ok=True)
+        asking.write_text("x")
+        self.log.unlink()
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("asking hooks installed", self.calls())
+
+    def test_uninstall_removes_the_asking_hooks(self):
+        self.fake_installed_herdr()
+        asking = self.home / ".local/bin/herdr-asking"
+        asking.parent.mkdir(parents=True, exist_ok=True)
+        asking.write_text('#!/bin/sh\necho "herdr-asking $*" >> "$FAKE_LOG"\n')
+        asking.chmod(0o755)
+        result = self.run_installer("--uninstall", "--yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("herdr-asking uninstall", self.calls())
+        self.assertIn("herdr-asking hooks", result.stdout)
 
     def test_uninstall_purge_deletes_config(self):
         self.fake_installed_herdr()

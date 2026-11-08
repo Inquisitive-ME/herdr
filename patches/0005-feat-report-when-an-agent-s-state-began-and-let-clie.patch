@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Richard Swanson <rswanson05@gmail.com>
+Date: Sun, 8 Nov 2026 07:00:49 -0600
+Subject: [PATCH] feat: report when an agent's state began and let clients move
+ panes
+
+Agents carry a state_since_ms token with the wall-clock time of their last state change, so clients can show how long an agent has been working, waiting or done. pane.move joins the client shell methods so the sidebar can move agents between spaces.
+
+diff --git a/src/app/actions.rs b/src/app/actions.rs
+index f01dd05b..503c8fd4 100644
+--- a/src/app/actions.rs
++++ b/src/app/actions.rs
+@@ -1756,6 +1756,10 @@ impl AppState {
+             self.next_agent_state_change_seq += 1;
+             if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                 terminal.last_agent_state_change_seq = Some(self.next_agent_state_change_seq);
++                terminal.agent_state_since_unix_ms = std::time::SystemTime::now()
++                    .duration_since(std::time::UNIX_EPOCH)
++                    .ok()
++                    .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
+                 terminal.last_agent_completion_seq = (!suppress_completion
+                     && is_completion_transition(&change))
+                 .then_some(self.next_agent_state_change_seq);
+@@ -3165,6 +3169,48 @@ mod tests {
+         app.assert_invariants_for_test();
+     }
+ 
++    /// Fork: agents carry when their current state began, for the sidebar's ages.
++    #[test]
++    fn state_changes_record_when_the_state_began() {
++        let mut app = app_with_workspaces(&["active"]);
++        let pane_id = app.workspaces[0].tabs[0].root_pane;
++        let terminal_id = app.workspaces[0].panes[&pane_id]
++            .attached_terminal_id
++            .clone();
++        let before = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .map(|elapsed| elapsed.as_millis() as u64)
++            .unwrap_or_default();
++        let change = |app: &mut AppState, state| {
++            app.handle_app_event(AppEvent::StateChanged {
++                pane_id,
++                agent: Some(Agent::Pi),
++                state,
++                visible_blocker: false,
++                visible_working: state == AgentState::Working,
++                process_exited: false,
++                observed_at: Instant::now(),
++            });
++        };
++        change(&mut app, AgentState::Working);
++        let since = app.terminals[&terminal_id].agent_state_since_unix_ms;
++        assert!(since.is_some_and(|since| since >= before));
++        // Repeating the same state keeps the original start.
++        app.terminals
++            .get_mut(&terminal_id)
++            .expect("terminal")
++            .agent_state_since_unix_ms = Some(1);
++        change(&mut app, AgentState::Working);
++        assert_eq!(
++            app.terminals[&terminal_id].agent_state_since_unix_ms,
++            Some(1)
++        );
++        change(&mut app, AgentState::Idle);
++        assert!(app.terminals[&terminal_id]
++            .agent_state_since_unix_ms
++            .is_some_and(|since| since >= before));
++    }
++
+     #[test]
+     fn completion_guard_unknown_to_idle_is_not_completed_work() {
+         assert_completion_guard_sequence(false, &[AgentState::Unknown, AgentState::Idle], false);
+diff --git a/src/app/agents.rs b/src/app/agents.rs
+index 89625f00..e8a587a6 100644
+--- a/src/app/agents.rs
++++ b/src/app/agents.rs
+@@ -378,7 +378,13 @@ impl App {
+         if !terminal.is_agent_terminal() {
+             return None;
+         }
+-        let pane = self.pane_metadata(ws_idx, pane_id)?;
++        let mut pane = self.pane_metadata(ws_idx, pane_id)?;
++        // Fork: when the agent entered its current state, for "working 12m" style ages.
++        if let Some(since) = terminal.agent_state_since_unix_ms {
++            pane.tokens
++                .entry(crate::metadata_tokens::STATE_SINCE_TOKEN.to_owned())
++                .or_insert_with(|| since.to_string());
++        }
+         Some(crate::api::schema::AgentInfo {
+             terminal_id: pane.terminal_id,
+             name: terminal.agent_name.clone(),
+diff --git a/src/metadata_tokens.rs b/src/metadata_tokens.rs
+index f79e8ae2..3f83b4be 100644
+--- a/src/metadata_tokens.rs
++++ b/src/metadata_tokens.rs
+@@ -14,6 +14,9 @@ pub(crate) struct MetadataTokens {
+ 
+ pub(crate) const MAX_SEQUENCE_SOURCES: usize = 32;
+ 
++/// Fork: token the server adds to agents with when their current state began (Unix ms).
++pub(crate) const STATE_SINCE_TOKEN: &str = "state_since_ms";
++
+ pub(crate) fn sequence_is_fresh(
+     sequences: &HashMap<String, u64>,
+     source: &str,
+diff --git a/src/server/client_commands.rs b/src/server/client_commands.rs
+index 87824c85..9eeae663 100644
+--- a/src/server/client_commands.rs
++++ b/src/server/client_commands.rs
+@@ -28,6 +28,8 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
+     "pane.input.set",
+     "pane.link.activate",
+     "pane.link.resolve",
++    // Fork: the sidebar's space tree moves agents between spaces.
++    "pane.move",
+     "pane.rename",
+     "pane.resize",
+     "pane.scroll",
+@@ -297,6 +299,11 @@ mod tests {
+             actual.remove("pane.link.resolve").as_deref(),
+             Some("f5e4a3e01453ae7b188f127ce951c12c20e0bebcc17cc364eeb6d1a01fd5bf81")
+         );
++        // Fork: additive, so it is frozen here rather than in the published fixture.
++        assert_eq!(
++            actual.remove("pane.move").as_deref(),
++            Some("eaed63cf205db2dc043ecce9e1a79cdca7f6e2521b364226bbf3121affadce7c")
++        );
+ 
+         assert_eq!(
+             actual, expected,
+diff --git a/src/terminal/state.rs b/src/terminal/state.rs
+index 11d540b1..5d381390 100644
+--- a/src/terminal/state.rs
++++ b/src/terminal/state.rs
+@@ -155,6 +155,8 @@ pub struct TerminalState {
+     pub state: AgentState,
+     pub last_agent_state_change_seq: Option<u64>,
+     pub last_agent_completion_seq: Option<u64>,
++    /// Fork: wall-clock time of the last agent state change, in Unix milliseconds.
++    pub agent_state_since_unix_ms: Option<u64>,
+     pub revision: u64,
+     pub launch_argv: Option<Vec<String>>,
+     pub respawn_shell_on_exit: bool,
+@@ -194,6 +196,7 @@ impl TerminalState {
+             metadata_token_sequence_sources: std::collections::HashSet::new(),
+             state: AgentState::Unknown,
+             last_agent_state_change_seq: None,
++            agent_state_since_unix_ms: None,
+             last_agent_completion_seq: None,
+             revision: 0,
+             launch_argv: None,
+@@ -2338,6 +2341,7 @@ impl TerminalState {
+         self.state = AgentState::Unknown;
+         self.last_agent_state_change_seq = None;
+         self.last_agent_completion_seq = None;
++        self.agent_state_since_unix_ms = None;
+         self.launch_argv = None;
+         self.respawn_shell_on_exit = false;
+         self.recent_agent_process_exit = None;

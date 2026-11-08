@@ -4,9 +4,11 @@
 # Install or update herdr from Inquisitive-ME/herdr releases:
 #   curl -fsSL https://raw.githubusercontent.com/Inquisitive-ME/herdr/main/install.sh | sh
 # Pass options after `sh -s --` when piping, e.g. `| sh -s -- --with-shell-count`:
-#   --with-shell-count  also install the shell-count watcher (extras/shell-count);
-#                       once installed, later runs update it too
-#   --uninstall         stop herdr, remove its agent integrations, the watcher and
+#   --with-shell-count  also install the shell-count watcher (extras/shell-count)
+#   --with-asking       also install Claude Code hooks that show what a waiting agent
+#                       is asking (extras/claude-asking)
+#                       Once an extra is installed, later runs update it too.
+#   --uninstall         stop herdr, remove its agent integrations, the extras and
 #                       the herdr binary
 #   --purge             with --uninstall, also delete herdr's config, saved sessions
 #                       and logs
@@ -14,9 +16,10 @@
 set -eu
 
 MANIFEST_URL="https://github.com/Inquisitive-ME/herdr/releases/latest/download/latest.json"
-EXTRAS_URL="https://raw.githubusercontent.com/Inquisitive-ME/herdr/main/extras/shell-count"
+EXTRAS_URL="https://raw.githubusercontent.com/Inquisitive-ME/herdr/main/extras"
 SHELL_COUNT_BIN="$HOME/.local/bin/herdr-shell-count"
 SHELL_COUNT_LABEL="com.inquisitive-me.herdr-shell-count"
+ASKING_BIN="$HOME/.local/bin/herdr-asking"
 
 log() { printf '  > %s\n' "$1"; }
 err() { printf 'error: %s\n' "$1" >&2; exit 1; }
@@ -117,15 +120,31 @@ install_herdr() {
     esac
 }
 
+# Download extras/<name>/<files...> into a fresh directory and print its path.
+fetch_extra() {
+    name=$1
+    shift
+    [ -n "$EXTRAS_TMP" ] || EXTRAS_TMP=$(mktemp -d)
+    mkdir -p "$EXTRAS_TMP/$name"
+    for file in "$@"; do
+        curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 "$EXTRAS_URL/$name/$file" \
+            -o "$EXTRAS_TMP/$name/$file" || err "cannot download $EXTRAS_URL/$name/$file"
+    done
+    printf '%s\n' "$EXTRAS_TMP/$name"
+}
+
 install_shell_count() {
     log "installing the shell-count watcher..."
-    EXTRAS_TMP=$(mktemp -d)
-    for file in install.sh herdr-shell-count.py herdr-shell-count.service "$SHELL_COUNT_LABEL.plist"; do
-        curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 "$EXTRAS_URL/$file" -o "$EXTRAS_TMP/$file" \
-            || err "cannot download $EXTRAS_URL/$file"
-    done
+    dir=$(fetch_extra shell-count install.sh herdr-shell-count.py herdr-shell-count.service \
+        "$SHELL_COUNT_LABEL.plist")
     # Its installer looks herdr up on PATH, which may not include a fresh install dir yet.
-    PATH="$INSTALL_DIR:$PATH" sh "$EXTRAS_TMP/install.sh"
+    PATH="$INSTALL_DIR:$PATH" sh "$dir/install.sh"
+}
+
+install_asking() {
+    log "installing the Claude Code asking hooks..."
+    dir=$(fetch_extra claude-asking install.sh herdr-asking)
+    sh "$dir/install.sh"
 }
 
 remove_shell_count() {
@@ -177,6 +196,8 @@ uninstall() {
             /"running":true/ && match($0, /"name":"[^"]*"/) {
                 printf "%s ", substr($0, RSTART + 8, RLENGTH - 9) }') || true
     fi
+    asking=0
+    [ ! -e "$ASKING_BIN" ] || asking=1
     watcher=0
     if [ -e "$SHELL_COUNT_BIN" ] || [ -e "$HOME/.config/systemd/user/herdr-shell-count.service" ] \
         || [ -e "$HOME/Library/LaunchAgents/$SHELL_COUNT_LABEL.plist" ]; then
@@ -186,7 +207,7 @@ uninstall() {
     if [ "$PURGE" = 1 ] && [ -e "$CONFIG_DIR" ]; then
         purge=1
     fi
-    if [ -z "$HERDR" ] && [ "$watcher" = 0 ] && [ "$purge" = 0 ]; then
+    if [ -z "$HERDR" ] && [ "$watcher" = 0 ] && [ "$asking" = 0 ] && [ "$purge" = 0 ]; then
         log "herdr is not installed; nothing to remove"
         return 0
     fi
@@ -195,6 +216,7 @@ uninstall() {
     [ -z "$sessions" ] || echo "  - stop running herdr sessions (${sessions% }), closing all their panes and agents"
     [ -z "$integrations" ] || echo "  - remove herdr's agent integrations: ${integrations% }"
     [ "$watcher" = 0 ] || echo "  - remove the shell-count watcher"
+    [ "$asking" = 0 ] || echo "  - remove the herdr-asking hooks from Claude Code's settings"
     [ -z "$HERDR" ] || echo "  - delete $HERDR"
     [ "$purge" = 0 ] || echo "  - delete $CONFIG_DIR (config, saved sessions, logs)"
     confirm
@@ -206,6 +228,10 @@ uninstall() {
     if [ "$watcher" = 1 ]; then
         remove_shell_count
         log "removed the shell-count watcher"
+    fi
+    if [ "$asking" = 1 ]; then
+        "$ASKING_BIN" uninstall >/dev/null 2>&1 \
+            && log "removed the herdr-asking hooks" || log "could not remove the herdr-asking hooks"
     fi
     for session in $sessions; do
         "$HERDR" session stop "$session" >/dev/null 2>&1 \
@@ -224,21 +250,24 @@ uninstall() {
 }
 
 WITH_SHELL_COUNT=0
+WITH_ASKING=0
 UNINSTALL=0
 PURGE=0
 YES=0
 for argument in "$@"; do
     case "$argument" in
         --with-shell-count) WITH_SHELL_COUNT=1 ;;
+        --with-asking) WITH_ASKING=1 ;;
         --uninstall) UNINSTALL=1 ;;
         --purge) PURGE=1 ;;
         --yes|-y) YES=1 ;;
-        -h|--help) sed -n '2,15p' "$0" 2>/dev/null || true; exit 0 ;;
+        -h|--help) sed -n '2,18p' "$0" 2>/dev/null || true; exit 0 ;;
         *) err "unknown option: $argument" ;;
     esac
 done
 [ "$PURGE" = 0 ] || [ "$UNINSTALL" = 1 ] || err "--purge only works with --uninstall"
-[ "$UNINSTALL" = 0 ] || [ "$WITH_SHELL_COUNT" = 0 ] || err "--with-shell-count can't be combined with --uninstall"
+[ "$UNINSTALL" = 0 ] || [ "$WITH_SHELL_COUNT$WITH_ASKING" = 00 ] \
+    || err "--with-shell-count and --with-asking can't be combined with --uninstall"
 
 if [ "$UNINSTALL" = 1 ]; then
     uninstall
@@ -247,5 +276,8 @@ else
     # Keep an installed watcher in step with the herdr it belongs to.
     if [ "$WITH_SHELL_COUNT" = 1 ] || [ -e "$SHELL_COUNT_BIN" ]; then
         install_shell_count
+    fi
+    if [ "$WITH_ASKING" = 1 ] || [ -e "$ASKING_BIN" ]; then
+        install_asking
     fi
 fi
