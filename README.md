@@ -38,9 +38,13 @@ The patches in `patches/`:
    - Drag a line onto another space to move it there as a new tab, or onto a line
      in the same space to reorder tabs. Right-click a line to rename its tab, move
      it to another or a new space, or close it. Clicking still jumps to it.
-   - `keys.next_agent` / `previous_agent` cycle the agents needing input (all agents
-     when none do), and `keys.focus_agent` follows the tree order, which shows the
-     numbers 1-9 beside agents while it's bound.
+   - `keys.focus_agent` follows the tree order, which shows the numbers 1-9 beside
+     agents while it's bound.
+7. **Waiting agents by urgency.** The section under the spaces lists agents needing
+   input (a permission, question or plan approval) first, then agents whose finished
+   turn you haven't looked at yet under a "finished" heading. Visiting an agent clears
+   it. `keys.next_agent` / `previous_agent` cycle the most urgent non-empty group (all
+   agents when nobody is waiting).
 
 Builds: Linux x86_64, Linux ARM (aarch64) and Apple Silicon macOS. There are no
 Windows or Intel Mac builds; use upstream herdr there.

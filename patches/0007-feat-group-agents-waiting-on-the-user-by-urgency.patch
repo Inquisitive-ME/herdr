@@ -1,0 +1,490 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Richard Swanson <rswanson05@gmail.com>
+Date: Sun, 8 Nov 2026 07:36:18 -0600
+Subject: [PATCH] feat: group agents waiting on the user by urgency
+
+The attention section lists agents needing input first, then agents with an unread finished turn under a finished heading; it is titled by its most urgent group. next_agent/previous_agent cycle the most urgent non-empty group.
+
+diff --git a/src/client/shell/agent_sidebar.rs b/src/client/shell/agent_sidebar.rs
+index dca69b80..d1fef727 100644
+--- a/src/client/shell/agent_sidebar.rs
++++ b/src/client/shell/agent_sidebar.rs
+@@ -57,25 +57,26 @@ pub(super) fn render_agent_panel(
+     agent_scroll: &mut usize,
+     hits: &mut ShellHitMap,
+ ) {
++    // Fork: every agent is listed under its space; this section shows who is waiting on
++    // the user, most urgent group first.
++    let (title, entries) =
++        super::space_agents::attention_entries(agent_rows(snapshot, config, None), |row| {
++            row.status
++        });
+     if !render_agent_panel_header(
+         buffer,
+         area,
++        title,
+         snapshot.agent_view_label.as_deref(),
+         config,
+         hits,
+     ) {
+         return;
+     }
+-
+-    // Fork: every agent is listed under its space; this section shows only who needs input.
+-    let rows = agent_rows(snapshot, config, None)
+-        .into_iter()
+-        .filter(|row| super::space_agents::needs_input(row.status))
+-        .collect::<Vec<_>>();
+     render_agent_list(
+         buffer,
+         area,
+-        &rows,
++        &entries,
+         snapshot
+             .agent_view_label
+             .as_ref()
+@@ -83,10 +84,15 @@ pub(super) fn render_agent_panel(
+         config,
+         agent_scroll,
+         hits,
+-        |row| row.rows.len(),
+-        |buffer, rect, row, hits| {
+-            hits.agents.push((rect, row.pane_id.clone()));
+-            render_agent_row(buffer, rect, row, config);
++        |entry| entry.lines(|row| row.rows.len()),
++        |buffer, rect, entry, hits| match entry {
++            super::space_agents::AttentionEntry::Heading(attention) => {
++                super::space_agents::render_attention_heading(buffer, rect, *attention, config)
++            }
++            super::space_agents::AttentionEntry::Agent(row) => {
++                hits.agents.push((rect, row.pane_id.clone()));
++                render_agent_row(buffer, rect, row, config);
++            }
+         },
+     );
+ }
+@@ -94,6 +100,7 @@ pub(super) fn render_agent_panel(
+ pub(super) fn render_agent_panel_header(
+     buffer: &mut Buffer,
+     area: Rect,
++    title: &str,
+     agent_view_label: Option<&str>,
+     config: &ClientShellConfig,
+     hits: &mut ShellHitMap,
+@@ -117,7 +124,7 @@ pub(super) fn render_agent_panel_header(
+         area.x,
+         area.y + 1,
+         area.width,
+-        " needs input",
++        title,
+         Style::default()
+             .fg(config.palette.overlay0)
+             .add_modifier(Modifier::BOLD),
+diff --git a/src/client/shell/endpoint_agents.rs b/src/client/shell/endpoint_agents.rs
+index db17f310..cbca4378 100644
+--- a/src/client/shell/endpoint_agents.rs
++++ b/src/client/shell/endpoint_agents.rs
+@@ -52,30 +52,39 @@ pub(super) fn render_expanded(
+     agent_scroll: &mut usize,
+     hits: &mut ShellHitMap,
+ ) {
++    // Fork: every agent is listed under its space; this section shows who is waiting on
++    // the user, most urgent group first.
++    let (title, entries) = super::space_agents::attention_entries(
++        agent_rows(endpoints, active_endpoint_id, config),
++        |row| row.agent.status,
++    );
+     if !super::agent_sidebar::render_agent_panel_header(
+         buffer,
+         area,
++        title,
+         agent_view_label,
+         config,
+         hits,
+     ) {
+         return;
+     }
+-    // Fork: every agent is listed under its space; this section shows only who needs input.
+-    let rows = agent_rows(endpoints, active_endpoint_id, config)
+-        .into_iter()
+-        .filter(|row| super::space_agents::needs_input(row.agent.status))
+-        .collect::<Vec<_>>();
+     super::agent_sidebar::render_agent_list(
+         buffer,
+         area,
+-        &rows,
++        &entries,
+         agent_view_label.map(|_| " no matching agents"),
+         config,
+         agent_scroll,
+         hits,
+-        |row| row.agent.rows.len(),
+-        |buffer, rect, row, hits| {
++        |entry| entry.lines(|row| row.agent.rows.len()),
++        |buffer, rect, entry, hits| {
++            let row = match entry {
++                super::space_agents::AttentionEntry::Heading(attention) => {
++                    super::space_agents::render_attention_heading(buffer, rect, *attention, config);
++                    return;
++                }
++                super::space_agents::AttentionEntry::Agent(row) => row,
++            };
+             super::agent_sidebar::render_agent_row(buffer, rect, &row.agent, config);
+             if row.stale {
+                 buffer.set_style(
+@@ -132,11 +141,10 @@ pub(super) fn needs_input_height(
+     active_endpoint_id: &ClientEndpointId,
+     config: &ClientShellConfig,
+ ) -> u16 {
+-    super::space_agents::list_height(
+-        agent_rows(endpoints, active_endpoint_id, config)
+-            .iter()
+-            .filter(|row| super::space_agents::needs_input(row.agent.status))
+-            .map(|row| row.agent.rows.len().min(u16::MAX as usize) as u16),
++    super::space_agents::attention_list_height(
++        agent_rows(endpoints, active_endpoint_id, config),
++        |row| row.agent.status,
++        |row| row.agent.rows.len(),
+         config.agents.row_gap,
+     )
+ }
+diff --git a/src/client/shell/space_agents.rs b/src/client/shell/space_agents.rs
+index 26158b2d..5ec06eaf 100644
+--- a/src/client/shell/space_agents.rs
++++ b/src/client/shell/space_agents.rs
+@@ -23,9 +23,112 @@ const NEEDS_INPUT_HEADER_ROWS: u16 = 3;
+ const COLLAPSED_KEY_PREFIX: &str = "fork.space-collapsed:";
+ const TERMINALS_HIDDEN_KEY_PREFIX: &str = "fork.space-terminals-hidden:";
+ 
+-/// Whether an agent belongs in the bottom "needs input" section.
+-pub(in crate::client::shell) fn needs_input(status: AgentStatus) -> bool {
+-    status == AgentStatus::Blocked
++/// How urgently an agent wants the user, most urgent first.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
++pub(in crate::client::shell) enum Attention {
++    /// Blocked on a prompt: a permission, a question or a plan approval.
++    NeedsInput,
++    /// Finished a turn the user hasn't looked at yet.
++    Finished,
++}
++
++impl Attention {
++    pub(in crate::client::shell) fn of(status: AgentStatus) -> Option<Self> {
++        match status {
++            AgentStatus::Blocked => Some(Self::NeedsInput),
++            AgentStatus::Done => Some(Self::Finished),
++            AgentStatus::Working | AgentStatus::Idle | AgentStatus::Unknown => None,
++        }
++    }
++
++    fn title(self) -> &'static str {
++        match self {
++            Self::NeedsInput => " needs input",
++            Self::Finished => " finished",
++        }
++    }
++}
++
++/// One entry of the attention section: a group heading or an agent row.
++pub(in crate::client::shell) enum AttentionEntry<T> {
++    /// A blank line, then the group's name.
++    Heading(Attention),
++    Agent(T),
++}
++
++impl<T> AttentionEntry<T> {
++    pub(in crate::client::shell) fn lines(&self, agent_lines: impl Fn(&T) -> usize) -> usize {
++        match self {
++            Self::Heading(_) => 2,
++            Self::Agent(row) => agent_lines(row),
++        }
++    }
++}
++
++/// Group the agents waiting on the user, most urgent group first, keeping their order
++/// within a group. The first group names the section; later groups get a heading.
++pub(in crate::client::shell) fn attention_entries<T>(
++    rows: Vec<T>,
++    status: impl Fn(&T) -> AgentStatus,
++) -> (&'static str, Vec<AttentionEntry<T>>) {
++    let mut grouped = rows
++        .into_iter()
++        .filter_map(|row| Attention::of(status(&row)).map(|attention| (attention, row)))
++        .collect::<Vec<_>>();
++    grouped.sort_by_key(|(attention, _)| *attention);
++    let title = grouped
++        .first()
++        .map_or(Attention::NeedsInput.title(), |(attention, _)| {
++            attention.title()
++        });
++    let mut entries = Vec::with_capacity(grouped.len() + 1);
++    let mut previous = None;
++    for (attention, row) in grouped {
++        if previous.is_some_and(|previous| previous != attention) {
++            entries.push(AttentionEntry::Heading(attention));
++        }
++        previous = Some(attention);
++        entries.push(AttentionEntry::Agent(row));
++    }
++    (title, entries)
++}
++
++/// Draw a group heading on the second line of its two-line entry.
++pub(in crate::client::shell) fn render_attention_heading(
++    buffer: &mut Buffer,
++    rect: Rect,
++    attention: Attention,
++    config: &ClientShellConfig,
++) {
++    if rect.height < 2 {
++        return;
++    }
++    put_text(
++        buffer,
++        rect.x,
++        rect.y + 1,
++        rect.width,
++        attention.title(),
++        Style::default()
++            .fg(config.palette.overlay0)
++            .add_modifier(Modifier::BOLD),
++    );
++}
++
++/// Height of the attention section's list for these rows.
++pub(in crate::client::shell) fn attention_list_height<T>(
++    rows: Vec<T>,
++    status: impl Fn(&T) -> AgentStatus,
++    agent_lines: impl Fn(&T) -> usize,
++    row_gap: u16,
++) -> u16 {
++    let (_, entries) = attention_entries(rows, status);
++    list_height(
++        entries
++            .iter()
++            .map(|entry| entry.lines(&agent_lines).min(u16::MAX as usize) as u16),
++        row_gap,
++    )
+ }
+ 
+ /// Key that marks a space's tree as collapsed.
+@@ -202,25 +305,26 @@ pub(in crate::client::shell) fn tree_agent_pane_ids(snapshot: &ClientShellSnapsh
+         .collect()
+ }
+ 
+-/// The agents next/previous agent cycles through: those needing input when any do,
+-/// otherwise all of them, in sidebar order.
++/// The agents next/previous agent cycles through, in sidebar order: those needing input
++/// when any do, else unread finished ones, else all of them.
+ pub(in crate::client::shell) fn agent_cycle(snapshot: &ClientShellSnapshot) -> Vec<String> {
+     let all = tree_agent_pane_ids(snapshot);
+-    let waiting = all
+-        .iter()
+-        .filter(|pane_id| {
+-            snapshot
+-                .agents
+-                .iter()
+-                .any(|agent| agent.pane_id == **pane_id && needs_input(agent.agent_status))
+-        })
+-        .cloned()
+-        .collect::<Vec<_>>();
+-    if waiting.is_empty() {
+-        all
+-    } else {
+-        waiting
++    for attention in [Attention::NeedsInput, Attention::Finished] {
++        let group = all
++            .iter()
++            .filter(|pane_id| {
++                snapshot.agents.iter().any(|agent| {
++                    agent.pane_id == **pane_id
++                        && Attention::of(agent.agent_status) == Some(attention)
++                })
++            })
++            .cloned()
++            .collect::<Vec<_>>();
++        if !group.is_empty() {
++            return group;
++        }
+     }
++    all
+ }
+ 
+ /// A named tab says the most about an agent; otherwise use the agent's own title.
+@@ -609,16 +713,15 @@ pub(in crate::client::shell) fn list_height(
+     total
+ }
+ 
+-/// Height of the local "needs input" list.
++/// Height of the local attention list.
+ pub(in crate::client::shell) fn local_needs_input_height(
+     snapshot: &ClientShellSnapshot,
+     config: &ClientShellConfig,
+ ) -> u16 {
+-    list_height(
+-        super::agent_sidebar::agent_rows(snapshot, config, None)
+-            .iter()
+-            .filter(|row| needs_input(row.status))
+-            .map(|row| row.rows.len().min(u16::MAX as usize) as u16),
++    attention_list_height(
++        super::agent_sidebar::agent_rows(snapshot, config, None),
++        |row| row.status,
++        |row| row.rows.len(),
+         config.agents.row_gap,
+     )
+ }
+@@ -1080,18 +1183,63 @@ mod tests {
+     use super::*;
+ 
+     #[test]
+-    fn needs_input_is_only_blocked() {
+-        assert!(needs_input(AgentStatus::Blocked));
++    fn only_blocked_and_unread_finished_agents_want_attention() {
++        assert_eq!(
++            Attention::of(AgentStatus::Blocked),
++            Some(Attention::NeedsInput)
++        );
++        assert_eq!(Attention::of(AgentStatus::Done), Some(Attention::Finished));
+         for status in [
+             AgentStatus::Working,
+-            AgentStatus::Done,
+             AgentStatus::Idle,
+             AgentStatus::Unknown,
+         ] {
+-            assert!(!needs_input(status));
++            assert_eq!(Attention::of(status), None);
+         }
+     }
+ 
++    fn entry_names(entries: &[AttentionEntry<(&'static str, AgentStatus)>]) -> Vec<&'static str> {
++        entries
++            .iter()
++            .map(|entry| match entry {
++                AttentionEntry::Heading(attention) => attention.title(),
++                AttentionEntry::Agent((name, _)) => name,
++            })
++            .collect()
++    }
++
++    #[test]
++    fn attention_groups_most_urgent_first_with_a_heading_between() {
++        let rows = vec![
++            ("a", AgentStatus::Done),
++            ("b", AgentStatus::Blocked),
++            ("c", AgentStatus::Idle),
++            ("d", AgentStatus::Done),
++            ("e", AgentStatus::Blocked),
++        ];
++        let (title, entries) = attention_entries(rows.clone(), |row| row.1);
++        assert_eq!(title, " needs input");
++        assert_eq!(entry_names(&entries), ["b", "e", " finished", "a", "d"]);
++        // Two two-line agents, the two-line heading and two one-line agents.
++        assert_eq!(
++            attention_list_height(
++                rows,
++                |row| row.1,
++                |row| if row.1 == AgentStatus::Blocked { 2 } else { 1 },
++                0
++            ),
++            2 + 2 + 2 + 1 + 1
++        );
++
++        let (title, entries) = attention_entries(vec![("a", AgentStatus::Done)], |row| row.1);
++        assert_eq!(title, " finished");
++        assert_eq!(entry_names(&entries), ["a"]);
++        assert_eq!(
++            attention_list_height(Vec::<(&str, AgentStatus)>::new(), |row| row.1, |_| 1, 0),
++            0
++        );
++    }
++
+     fn agent_with_tokens(tokens: &[(&str, &str)]) -> ClientShellAgent {
+         ClientShellAgent {
+             pane_id: "w1:p1".into(),
+@@ -1309,10 +1457,17 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn agents_cycle_in_sidebar_order_needing_input_first() {
++    fn agents_cycle_in_sidebar_order_most_urgent_group_first() {
+         let mut snapshot = fridge();
+         assert_eq!(tree_agent_pane_ids(&snapshot), ["p1", "p2", "p5"]);
+         assert_eq!(agent_cycle(&snapshot), ["p2", "p5"]);
++        // With nobody blocked, unread finished agents come next.
++        for agent in &mut snapshot.agents {
++            if agent.agent_status == AgentStatus::Blocked {
++                agent.agent_status = AgentStatus::Working;
++            }
++        }
++        assert_eq!(agent_cycle(&snapshot), ["p1"]);
+         for agent in &mut snapshot.agents {
+             agent.agent_status = AgentStatus::Working;
+         }
+diff --git a/src/client/shell/tests/space_tree.rs b/src/client/shell/tests/space_tree.rs
+index 4baf1948..3247f4b9 100644
+--- a/src/client/shell/tests/space_tree.rs
++++ b/src/client/shell/tests/space_tree.rs
+@@ -236,3 +236,63 @@ fn agent_lines_show_how_long_they_have_been_in_their_state() {
+         .collect::<String>();
+     assert!(row.trim_end().ends_with("12m"), "{row}");
+ }
++
++#[test]
++fn waiting_agents_are_grouped_needs_input_then_finished() {
++    let mut snapshot = tree_snapshot();
++    // The focused agent counts as read, so the unread finished one is in another tab.
++    snapshot.agents[0].agent_status = AgentStatus::Blocked;
++    snapshot.agents[1].agent_status = AgentStatus::Working;
++    snapshot.agents[1].state_change_seq = 1;
++    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
++    state.set_snapshot(Box::new(snapshot.clone()));
++    // The client marks an agent finished once it has seen it work and then stop.
++    snapshot.revision = 2;
++    snapshot.agents[1].agent_status = AgentStatus::Done;
++    snapshot.agents[1].state_change_seq = 2;
++    state.set_snapshot(Box::new(snapshot));
++    let mut surface = surface();
++    surface.projection_revision = 2;
++    state.set_pane_surface(surface);
++    let frame = state.compose(106, 30).expect("frame");
++    let sidebar = frame_rows(&frame)
++        .into_iter()
++        .map(|row| {
++            row.chars()
++                .take(24)
++                .collect::<String>()
++                .trim_end()
++                .to_owned()
++        })
++        .collect::<Vec<_>>();
++    let needs_input = sidebar
++        .iter()
++        .position(|row| row == " needs input")
++        .expect("title");
++    let finished = sidebar
++        .iter()
++        .position(|row| row == " finished")
++        .unwrap_or_else(|| panic!("{sidebar:#?}"));
++    assert!(needs_input < finished, "{sidebar:#?}");
++    // The blocked agent sits under "needs input", the finished one under "finished".
++    let blocked_row = state
++        .hits
++        .agents
++        .iter()
++        .filter(|(rect, id)| id == "pane_1" && rect.y > needs_input as u16)
++        .map(|(rect, _)| rect.y as usize)
++        .next()
++        .expect("blocked agent row");
++    let done_row = state
++        .hits
++        .agents
++        .iter()
++        .filter(|(rect, id)| id == "pane_2" && rect.y > needs_input as u16)
++        .map(|(rect, _)| rect.y as usize)
++        .next()
++        .expect("finished agent row");
++    assert!(
++        needs_input < blocked_row && blocked_row < finished && finished < done_row,
++        "{sidebar:#?}"
++    );
++}
