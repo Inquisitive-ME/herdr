@@ -1,0 +1,3 @@
+* text=auto eol=lf
+# Preserve format-patch bytes for the queue hash and git am on every runner.
+*.patch -text

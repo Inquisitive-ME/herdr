@@ -1,0 +1,384 @@
+name: Build patched herdr
+
+on:
+  schedule:
+    - cron: '23 9 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Stable upstream release tag (blank selects the latest)'
+        required: false
+        type: string
+      force:
+        description: 'Rebuild and replace assets even if this release already exists'
+        default: false
+        type: boolean
+  push:
+    branches: [main]
+    paths:
+      - 'patches/**'
+      - 'scripts/**'
+      - UPSTREAM_BASE
+      - .github/workflows/build.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: patch-queue-releases
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_tag: ${{ steps.plan.outputs.upstream_tag }}
+      release_tag: ${{ steps.plan.outputs.release_tag }}
+      build: ${{ steps.plan.outputs.build }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Select stable upstream release and hash the queue
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+          FORCE_BUILD: ${{ inputs.force == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+          from urllib.parse import quote
+
+          def get(path, missing_ok=False):
+              request = urllib.request.Request(
+                  'https://api.github.com/' + path,
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Accept': 'application/vnd.github+json',
+                           'X-GitHub-Api-Version': '2022-11-28'},
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      return json.load(response)
+              except urllib.error.HTTPError as error:
+                  if missing_ok and error.code == 404:
+                      return None
+                  raise
+
+          def stable(release):
+              return (not release['draft'] and not release['prerelease']
+                      and re.fullmatch(r'v\d+\.\d+\.\d+', release['tag_name']))
+
+          tag = os.environ['REQUESTED_TAG'].strip()
+          if tag:
+              if not re.fullmatch(r'v\d+\.\d+\.\d+', tag):
+                  raise SystemExit('upstream_tag must be a stable vMAJOR.MINOR.PATCH tag')
+              release = get('repos/herdrdev/herdr/releases/tags/' + quote(tag, safe=''))
+              if not stable(release):
+                  raise SystemExit('Requested upstream release is a draft or prerelease')
+          else:
+              releases = []
+              page = 1
+              while True:
+                  batch = get(f'repos/herdrdev/herdr/releases?per_page=100&page={page}')
+                  releases.extend(r for r in batch if stable(r))
+                  if len(batch) < 100:
+                      break
+                  page += 1
+              if not releases:
+                  raise SystemExit('No published stable upstream release found')
+              release = max(releases, key=lambda r: tuple(map(int, r['tag_name'][1:].split('.'))))
+              tag = release['tag_name']
+
+          # Hash the concatenated bytes in C/filename order; the empty queue hashes to e3b0c442.
+          digest = hashlib.sha256()
+          for patch in sorted(Path('patches').glob('*.patch')):
+              digest.update(patch.read_bytes())
+          release_tag = tag + '-tree.' + digest.hexdigest()[:8]
+          existing = get(f"repos/{os.environ['GITHUB_REPOSITORY']}/releases/tags/{release_tag}", missing_ok=True)
+          build = existing is None or os.environ['FORCE_BUILD'] == 'true'
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'upstream_tag={tag}\nrelease_tag={release_tag}\nbuild={str(build).lower()}\n')
+          print(f'{tag} -> {release_tag}; build={build}')
+          PY
+
+  check-patches:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GIT_COMMITTER_NAME: github-actions[bot]
+      GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: queue
+          persist-credentials: false
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: herdrdev/herdr
+          ref: ${{ needs.plan.outputs.upstream_tag }}
+          fetch-depth: 0
+          path: upstream
+          persist-credentials: false
+      - name: Check patches once before the matrix
+        id: apply
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          queue/scripts/apply-patches.sh upstream 2>&1 | tee "$RUNNER_TEMP/patches.log"
+      - name: Report patch failure
+        if: steps.apply.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ needs.plan.outputs.upstream_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.request
+          from pathlib import Path
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          title = "Patches don't apply to " + os.environ['UPSTREAM_TAG']
+          log = (Path(os.environ['RUNNER_TEMP']) / 'patches.log').read_text(errors='replace')
+          failed = re.findall(r'^Failed patch: (.+)$', log, re.M)
+          run = f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          body = (f"Patch check failed in [this workflow run]({run}).\n\n"
+                  f"Failing patch: {failed[-1] if failed else 'see output below'}\n\n"
+                  f"<details><summary>git am output (last 50,000 characters)</summary>\n\n"
+                  f"````text\n{log[-50000:]}\n````\n</details>\n")
+
+          def api(path, data=None):
+              request = urllib.request.Request(
+                  f'https://api.github.com/repos/{repo}/' + path,
+                  data=None if data is None else json.dumps(data).encode(),
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Accept': 'application/vnd.github+json',
+                           'Content-Type': 'application/json',
+                           'X-GitHub-Api-Version': '2022-11-28'},
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+
+          page = 1
+          existing = None
+          while True:
+              issues = api(f'issues?state=open&per_page=100&page={page}')
+              existing = next((i for i in issues if 'pull_request' not in i and i['title'] == title), None)
+              if existing or len(issues) < 100:
+                  break
+              page += 1
+          if existing:
+              api(f"issues/{existing['number']}/comments", {'body': body})
+          else:
+              api('issues', {'title': title, 'body': body})
+          PY
+      - name: Fail after reporting
+        if: steps.apply.outcome == 'failure'
+        run: exit 1
+
+  build:
+    needs: [plan, check-patches]
+    if: needs.plan.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: herdr-linux-x86_64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            name: herdr-linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: herdr-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: herdr-macos-aarch64
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            name: herdr-windows-x86_64.zip
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: upstream
+    env:
+      LIBGHOSTTY_VT_OPTIMIZE: ReleaseFast
+      LIBGHOSTTY_VT_SIMD: 'true'
+      GIT_COMMITTER_NAME: github-actions[bot]
+      GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+      UPSTREAM_TAG: ${{ needs.plan.outputs.upstream_tag }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: queue
+          persist-credentials: false
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: herdrdev/herdr
+          ref: ${{ needs.plan.outputs.upstream_tag }}
+          fetch-depth: 0
+          path: upstream
+          persist-credentials: false
+      - name: Apply patches
+        shell: bash
+        run: ../queue/scripts/apply-patches.sh .
+      - name: Read Rust toolchain and verify version
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_VERSION=$(awk -F '"' '/^version =/ { print $2; exit }' Cargo.toml)
+          test "$CARGO_VERSION" = "${UPSTREAM_TAG#v}"
+          TOOLCHAIN=$(awk -F '"' '/^channel =/ { print $2; exit }' rust-toolchain.toml)
+          test -n "$TOOLCHAIN"
+          echo "toolchain=$TOOLCHAIN" >> "$GITHUB_OUTPUT"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ steps.source.outputs.toolchain }}
+          targets: ${{ matrix.target }}
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+      - name: Prefer official Ubuntu mirrors over Azure
+        if: runner.os == 'Linux'
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i '/azure.archive.ubuntu.com/d' /etc/apt/apt-mirrors.txt
+            cat /etc/apt/apt-mirrors.txt
+          fi
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo find /etc/apt/sources.list.d -type f \( -iname '*microsoft*' -o -iname '*azure-cli*' \) -print -delete
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build musl-tools gcc-aarch64-linux-gnu crossbuild-essential-arm64
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install cmake ninja
+      - name: Set Linux aarch64 linker
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: release-tree-${{ matrix.target }}
+          workspaces: upstream -> target
+      - name: Remove Zig caches
+        shell: bash
+        run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package Unix artifact
+        if: runner.os != 'Windows'
+        shell: bash
+        run: cp target/${{ matrix.target }}/release/herdr ${{ matrix.name }}
+      - name: Package Windows artifact with upstream's ConPTY runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = Join-Path $env:RUNNER_TEMP "Microsoft.Windows.Console.ConPTY.nupkg"
+          $stage = Join-Path $env:RUNNER_TEMP "herdr-windows-x86_64"
+          .\scripts\package_windows_conpty.ps1 `
+            -HerdrExe target\${{ matrix.target }}\release\herdr.exe `
+            -PackagePath $package `
+            -StageDir $stage `
+            -OutputPath ${{ matrix.name }}
+          $version = (& (Join-Path $stage "herdr.exe") --version | Out-String).Trim()
+          $tagVersion = $env:UPSTREAM_TAG -replace '^v', ''
+          if ($version -notmatch [regex]::Escape($tagVersion) -or $version -match "preview") {
+            throw "Packaged Windows binary has unexpected version identity: $version"
+          }
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.name }}
+          path: upstream/${{ matrix.name }}
+          if-no-files-found: error
+
+  publish:
+    needs: [plan, build]
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: queue
+          persist-credentials: false
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: herdrdev/herdr
+          ref: ${{ needs.plan.outputs.upstream_tag }}
+          path: upstream
+          persist-credentials: false
+      - name: Download all five artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: herdr-*
+          merge-multiple: true
+          path: dist
+      - name: Prepare notes and update manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ needs.plan.outputs.upstream_tag }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/herdrdev/herdr/releases/tags/$UPSTREAM_TAG" --jq '.body // ""' > dist/RELEASE_NOTES.md
+          printf '\nThis build adds the Inquisitive-ME patches.\n' >> dist/RELEASE_NOTES.md
+          python3 queue/scripts/make-manifest.py \
+            --source-dir upstream --assets-dir dist --repo "$GITHUB_REPOSITORY" \
+            --release-tag "$RELEASE_TAG" --notes-file dist/RELEASE_NOTES.md --output dist/latest.json
+          cd dist
+          sha256sum herdr-linux-x86_64 herdr-linux-aarch64 herdr-macos-x86_64 \
+            herdr-macos-aarch64 herdr-windows-x86_64.zip latest.json > SHA256SUMS
+      - name: Publish stable release as latest
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          tag_name: ${{ needs.plan.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.plan.outputs.release_tag }}
+          draft: false
+          prerelease: false
+          make_latest: 'true'
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          body_path: dist/RELEASE_NOTES.md
+          files: |
+            dist/herdr-linux-x86_64
+            dist/herdr-linux-aarch64
+            dist/herdr-macos-x86_64
+            dist/herdr-macos-aarch64
+            dist/herdr-windows-x86_64.zip
+            dist/latest.json
+            dist/SHA256SUMS

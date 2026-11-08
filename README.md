@@ -1,0 +1,84 @@
+# herdr patch queue
+
+Builds of [herdrdev/herdr](https://github.com/herdrdev/herdr) stable releases with
+the Inquisitive-ME sidebar patches. This repository holds patches, scripts, and
+CI, not an upstream source checkout.
+
+The patches in `patches/`:
+
+1. **Agents under their space.** Each space in the sidebar lists its agents
+   underneath, and clicking one jumps to that agent. The agent section below only
+   shows agents that need input and only appears while one does. Most of the code
+   is in a new file (`src/client/shell/space_agents.rs`) so upstream changes rarely
+   conflict with it. Upstream's sidebar tests for the replaced agent list, sort
+   toggle and fixed divider fail with this patch; that is expected and CI does not
+   run them.
+2. **Updates from this repo.** `herdr update`, background version checks and
+   remote installs read this repository's `latest.json` instead of herdr.dev.
+
+Install on Linux or macOS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Inquisitive-ME/herdr/main/install.sh | sh
+```
+
+Install on Windows in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Inquisitive-ME/herdr/main/install.ps1 | iex
+```
+
+The installers verify SHA-256 checksums. Unix replaces the `herdr` on PATH
+atomically, or installs to `~/.local/bin/herdr` if none exists. Set
+`HERDR_INSTALL_DIR` to choose another directory. Windows follows upstream's
+`HERDR_HOME` (default `~/.herdr`) package layout, keeps releases under
+`packages/standalone/releases`, and updates the user and current session PATH.
+Its visible bin junction defaults to `%LOCALAPPDATA%\Programs\Herdr\bin`;
+`HERDR_INSTALL_DIR` overrides that junction location. Windows ARM64 uses the
+x86_64 package under emulation, as upstream does.
+
+After the first patched install, `herdr update` follows this repository's
+`latest.json`. Upstream compares the Cargo version, so patch-only rebuilds of the same version
+require rerunning the installer. Windows uses a checksum in its install directory
+name so those reinstalls pick up changed packages too.
+
+CI checks daily and on queue/script changes. It picks the latest published stable
+upstream version and publishes `<upstream_tag>-tree.<8-digit-patch-sha256>`.
+The hash covers the concatenated bytes of `patches/*.patch` in filename order.
+Existing release tags are skipped; a manual run can select `upstream_tag` and
+set `force` to replace the assets. The release includes five platform assets,
+`latest.json`, and `SHA256SUMS` (covering the assets and manifest).
+
+When patches stop applying, CI opens an issue titled `Patches don't apply to
+<tag>`, or comments on the existing open issue. Rebase the patched `herdr-src`
+branch onto the new tag, resolve conflicts, then run:
+
+```sh
+scripts/export-patches.sh /path/to/herdr-src vNEW.VERSION.HERE
+```
+
+Review the exported patches and `UPSTREAM_BASE`, then push the patch queue.
+Export defaults to `/home/richard/workspace/herdr-src` and the tag in
+`UPSTREAM_BASE`. The source checkout must be clean. To apply a queue manually:
+
+```sh
+scripts/apply-patches.sh /path/to/clean/upstream-checkout
+```
+
+The manifest reads the version and thin-client `PROTOCOL_VERSION` from the
+release tag. Endpoint generation is a separate compatibility contract: it uses
+`https://herdr.dev/latest.json`'s `releases[version].endpoint_generation` when
+available. If missing or the server is unreachable, it emits `null`, which
+upstream treats as requiring a server restart. It never guesses from the
+protocol number or another release. A local snapshot can be supplied with
+`--upstream-manifest`, or a known generation with `--endpoint-generation`.
+
+Local manifest and installer tests (Python 3.10+):
+
+```sh
+python3 -B -m unittest discover -s scripts -p 'test_*.py'
+```
+
+herdr is developed by [herdrdev/herdr](https://github.com/herdrdev/herdr) and
+licensed under Apache-2.0. The Unix and Windows installers are adapted from
+upstream's distribution scripts. See [LICENSE](LICENSE).
