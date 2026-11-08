@@ -52,6 +52,18 @@ The patches in `patches/`:
    reattaching doesn't empty the finished list. Upstream's
    `first_snapshot_establishes_an_idle_baseline_without_server_seen_authority` test
    asserts the old behavior and fails by design.
+10. **Agent times survive server swaps (server).** A live handoff carries each agent's
+    state and start time, so ages don't reset when the server binary is replaced.
+11. **`herdr update` finds our rebuilds.** CI compiles the release tag in, `latest.json`
+    carries it as `release`, and a different release of the same upstream version
+    counts as an update. `herdr --version` prints the release.
+12. **Multi-machine sidebar.** With machines added, the space tree on the machine
+    being shown supports dragging and the right-click menu. Clicking another machine's
+    agent switches to it on release. The agent keys walk the tree across all machines,
+    most urgent group first, and show the numbers there too. Upstream's
+    `local_agent_click_can_cancel_a_pending_remote_switch` and
+    `switching_machines_preserves_aggregate_agent_scroll_and_visible_rows` expect the
+    switch on mouse-down and fail by design.
 
 Builds: Linux x86_64, Linux ARM (aarch64) and Apple Silicon macOS. There are no
 Windows or Intel Mac builds; use upstream herdr there.
@@ -132,10 +144,10 @@ Options go after `sh -s --` when piping, e.g. `... | sh -s -- --with-shell-count
 
 ### Updating
 
-Rerun the install command; it also updates any installed extras. `herdr update`
-follows this repository's `latest.json` but only notices new upstream versions,
-because it compares the upstream version number, so it misses patch-only rebuilds
-like `tree.7aa748df` to `tree.21330f2a`.
+Run `herdr update` outside herdr, or rerun the install command, which also updates
+the extras. Builds before `tree.<patch 11>` can't see patch-only rebuilds, so update
+those once with the install command. When a release changes the server (the README
+marks those patches), swap it with the live-handoff command above.
 
 CI checks daily and on queue/script changes. It picks the latest published stable
 upstream version and publishes `<upstream_tag>-tree.<8-digit-patch-sha256>`.
@@ -144,8 +156,21 @@ Existing release tags are skipped; a manual run can select `upstream_tag` and
 set `force` to replace the assets. The release includes the three platform assets,
 `latest.json`, and `SHA256SUMS` (covering the assets and manifest).
 
+Before publishing, CI runs `scripts/fork-tests.sh`, the tests covering the patches,
+and the script tests; a failure blocks the release.
+
 When patches stop applying, CI opens an issue titled `Patches don't apply to
-<tag>`, or comments on the existing open issue. Rebase the patched `herdr-src`
+<tag>`, or comments on the existing open issue. It then runs
+[`fix-patches.yml`](.github/workflows/fix-patches.yml): Claude rebases the patches
+onto the new tag on a read-only runner, the workflow re-checks that the exported queue
+applies, builds and passes the fork tests, and opens a pull request
+(`auto/rebase-<tag>`) for you to review and merge. If that fails, it comments on the
+issue. This needs a `CLAUDE_CODE_OAUTH_TOKEN` repository secret (from
+`claude setup-token`) or an `ANTHROPIC_API_KEY`, plus "Allow GitHub Actions to create
+and approve pull requests" in the repository's Actions settings. You can also run
+it by hand from the Actions tab with an upstream tag.
+
+To fix it yourself instead, rebase the patched `herdr-src`
 branch onto the new tag, resolve conflicts, then run:
 
 ```sh

@@ -49,13 +49,14 @@ class ManifestTests(unittest.TestCase):
     def test_cli_dummy_assets_match_upstream_schema_and_checksums(self):
         subprocess.run([sys.executable, "-B", *self.args(), "--upstream-manifest", str(self.snapshot)], check=True)
         manifest = json.loads(self.output.read_text())
-        self.assertEqual(set(manifest), {"version", "protocol", "endpoint_generation", "notes", "assets", "sha256", "releases"})
+        self.assertEqual(set(manifest), {"version", "release", "protocol", "endpoint_generation", "notes", "assets", "sha256", "releases"})
+        self.assertEqual(manifest["release"], "v0.9.5-tree.1234abcd")
         self.assertEqual((manifest["version"], manifest["protocol"], manifest["endpoint_generation"]), ("0.9.5", 22, 1))
         self.assertEqual(set(manifest["assets"]), set(manifest_tool.ASSETS))
         for key, name in manifest_tool.ASSETS.items():
             self.assertEqual(manifest["assets"][key], f"https://github.com/Inquisitive-ME/herdr/releases/download/v0.9.5-tree.1234abcd/{name}")
             self.assertEqual(manifest["sha256"][key], hashlib.sha256((self.assets / name).read_bytes()).hexdigest())
-        self.assertEqual(manifest["releases"]["0.9.5"], {k: v for k, v in manifest.items() if k not in ("version", "releases")})
+        self.assertEqual(manifest["releases"]["0.9.5"], {k: v for k, v in manifest.items() if k not in ("version", "release", "releases")})
         self.assertEqual(manifest["notes"], self.notes.read_text().strip())
 
     def test_missing_generation_stays_unknown(self):

@@ -100,7 +100,9 @@ def make_manifest(
     }
     # String URLs + a separate SHA map also support upstream's Unix installer.
     # metadata_for_version uses the top level for latest and releases for archived notes.
-    return {"version": version, **metadata, "releases": {version: dict(metadata)}}
+    # "release" lets the patched updater see rebuilds of the same upstream version.
+    return {"version": version, "release": release_tag, **metadata,
+            "releases": {version: dict(metadata)}}
 
 
 def main() -> None:

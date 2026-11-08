@@ -1,0 +1,514 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Richard Swanson <rswanson05@gmail.com>
+Date: Sun, 8 Nov 2026 09:13:54 -0600
+Subject: [PATCH] feat: drag, menus and agent order in the multi-machine
+ sidebar
+
+Tree lines of the machine being shown drag and open their menu as on a single machine. Clicking any machine's line switches to it on release. next/previous/focus agent follow the tree across machines, most urgent group first, and focus_agent numbers show there too. Upstream's local_agent_click_can_cancel_a_pending_remote_switch and switching_machines_preserves_aggregate_agent_scroll_and_visible_rows expect the switch on mouse-down.
+
+diff --git a/src/client/shell/endpoint_navigation.rs b/src/client/shell/endpoint_navigation.rs
+index 3d99e5a6..cd3179d8 100644
+--- a/src/client/shell/endpoint_navigation.rs
++++ b/src/client/shell/endpoint_navigation.rs
+@@ -92,11 +92,9 @@ impl ClientShellState {
+         else {
+             return false;
+         };
+-        self.focus_or_activate(
+-            endpoint_id,
+-            ClientEndpointFocusTarget::Pane(pane_id),
+-            outcome,
+-        );
++        // Fork: switch on release, so lines on the machine being shown can be dragged.
++        let _ = outcome;
++        self.press_space_line(endpoint_id, pane_id, point.0, point.1);
+         true
+     }
+ 
+@@ -167,11 +165,14 @@ impl ClientShellState {
+             action,
+             KeybindAction::PreviousAgent | KeybindAction::NextAgent | KeybindAction::FocusAgent(_)
+         ) {
+-            let agents = super::aggregate_navigation::online_agent_targets(
+-                &self.endpoints,
+-                &self.active_endpoint_id,
+-                self.config.agent_panel_sort,
+-            );
++            // Fork: sidebar tree order across machines; next/previous take the most
++            // urgent group first.
++            let agents = match action {
++                KeybindAction::FocusAgent(_) => {
++                    super::space_agents::endpoint_focus_targets(&self.endpoints)
++                }
++                _ => super::space_agents::endpoint_agent_cycle(&self.endpoints),
++            };
+             if agents.is_empty() {
+                 return true;
+             }
+diff --git a/src/client/shell/endpoint_sidebar.rs b/src/client/shell/endpoint_sidebar.rs
+index 9d712bd2..41706629 100644
+--- a/src/client/shell/endpoint_sidebar.rs
++++ b/src/client/shell/endpoint_sidebar.rs
+@@ -361,6 +361,7 @@ pub(super) fn render_expanded(
+             .saturating_sub(WORKSPACE_HEADER_ROWS + 1),
+     );
+     hits.workspace_body = body;
++    let agent_numbers = super::space_agents::endpoint_agent_numbers(state.endpoints, config);
+     let reveal_navigation = !body.is_empty() && std::mem::take(state.reveal_navigation_workspace);
+     let reveal_focus = !body.is_empty() && std::mem::take(state.reveal_focused_workspace);
+     if reveal_navigation || reveal_focus {
+@@ -508,7 +509,11 @@ pub(super) fn render_expanded(
+                     agent_area,
+                     if entry.indented { 8 } else { 3 },
+                     &tree,
+-                    &[],
++                    &|pane_id| {
++                        agent_numbers
++                            .iter()
++                            .position(|(id, pane)| *id == endpoint.endpoint_id && pane == pane_id)
++                    },
+                     endpoint_active,
+                     config,
+                     super::space_agents::now_unix_ms(),
+diff --git a/src/client/shell/mouse.rs b/src/client/shell/mouse.rs
+index 6c61b661..05d1f8ab 100644
+--- a/src/client/shell/mouse.rs
++++ b/src/client/shell/mouse.rs
+@@ -2166,7 +2166,12 @@ impl ClientShellState {
+                     .map(|(_, pane_id)| pane_id.clone());
+                 if let Some(pane_id) = agent_pane_id {
+                     // Fork: focus on release, so the line can be dragged to another space.
+-                    self.press_space_line(pane_id, mouse.column, mouse.row);
++                    self.press_space_line(
++                        self.active_endpoint_id.clone(),
++                        pane_id,
++                        mouse.column,
++                        mouse.row,
++                    );
+                     return;
+                 }
+                 let scrollbar_hit = self
+diff --git a/src/client/shell/sidebar.rs b/src/client/shell/sidebar.rs
+index da7105a5..21eea77d 100644
+--- a/src/client/shell/sidebar.rs
++++ b/src/client/shell/sidebar.rs
+@@ -380,7 +380,7 @@ pub(crate) fn render_sidebar(
+             ),
+             if entry.indented { 8 } else { 3 },
+             &tree,
+-            &agent_numbers,
++            &|pane_id| agent_numbers.iter().position(|id| id == pane_id),
+             true,
+             config,
+             now_ms,
+diff --git a/src/client/shell/space_agents.rs b/src/client/shell/space_agents.rs
+index 5a6a7449..b92c2c0d 100644
+--- a/src/client/shell/space_agents.rs
++++ b/src/client/shell/space_agents.rs
+@@ -327,6 +327,86 @@ pub(in crate::client::shell) fn agent_cycle(snapshot: &ClientShellSnapshot) -> V
+     all
+ }
+ 
++/// Online machines' agents in sidebar order: machines top to bottom, then spaces, then
++/// tabs, with each agent's status as this client shows it.
++fn endpoint_tree_agents(
++    endpoints: &[ClientShellEndpoint],
++) -> Vec<(ClientEndpointId, String, AgentStatus)> {
++    endpoints
++        .iter()
++        .filter(|endpoint| endpoint.status == ClientEndpointStatus::Online)
++        .filter_map(|endpoint| Some((endpoint, endpoint.snapshot.as_deref()?)))
++        .flat_map(|(endpoint, snapshot)| {
++            tree_agent_pane_ids(snapshot)
++                .into_iter()
++                .map(|pane_id| {
++                    let status = snapshot
++                        .agents
++                        .iter()
++                        .find(|agent| agent.pane_id == pane_id)
++                        .map_or(AgentStatus::Unknown, |agent| agent.agent_status);
++                    (endpoint.endpoint_id.clone(), pane_id, status)
++                })
++                .collect::<Vec<_>>()
++        })
++        .collect()
++}
++
++fn aggregate_targets(
++    agents: impl IntoIterator<Item = (ClientEndpointId, String, AgentStatus)>,
++) -> Vec<super::aggregate_navigation::AggregateAgentTarget> {
++    agents
++        .into_iter()
++        .map(
++            |(endpoint_id, pane_id, _)| super::aggregate_navigation::AggregateAgentTarget {
++                endpoint_id,
++                pane_id,
++            },
++        )
++        .collect()
++}
++
++/// Multi-machine `focus_agent` targets: every agent in sidebar order.
++pub(in crate::client::shell) fn endpoint_focus_targets(
++    endpoints: &[ClientShellEndpoint],
++) -> Vec<super::aggregate_navigation::AggregateAgentTarget> {
++    aggregate_targets(endpoint_tree_agents(endpoints))
++}
++
++/// Multi-machine next/previous agent: the most urgent non-empty group across all
++/// machines, else every agent, in sidebar order.
++pub(in crate::client::shell) fn endpoint_agent_cycle(
++    endpoints: &[ClientShellEndpoint],
++) -> Vec<super::aggregate_navigation::AggregateAgentTarget> {
++    let all = endpoint_tree_agents(endpoints);
++    for attention in [Attention::NeedsInput, Attention::Finished] {
++        let group = all
++            .iter()
++            .filter(|(_, _, status)| Attention::of(*status) == Some(attention))
++            .cloned()
++            .collect::<Vec<_>>();
++        if !group.is_empty() {
++            return aggregate_targets(group);
++        }
++    }
++    aggregate_targets(all)
++}
++
++/// Multi-machine agent numbers 1-9 as (machine, pane), when `keys.focus_agent` is bound.
++pub(in crate::client::shell) fn endpoint_agent_numbers(
++    endpoints: &[ClientShellEndpoint],
++    config: &ClientShellConfig,
++) -> Vec<(ClientEndpointId, String)> {
++    if config.keybinds.keybinds.focus_agent.is_empty() {
++        return Vec::new();
++    }
++    endpoint_tree_agents(endpoints)
++        .into_iter()
++        .take(9)
++        .map(|(endpoint_id, pane_id, _)| (endpoint_id, pane_id))
++        .collect()
++}
++
+ /// A named tab says the most about an agent; otherwise use the agent's own title.
+ fn agent_label<'a>(snapshot: &'a ClientShellSnapshot, agent: &'a ClientShellAgent) -> &'a str {
+     snapshot
+@@ -509,7 +589,7 @@ pub(in crate::client::shell) fn render_space_tree(
+     area: Rect,
+     indent: u16,
+     tree: &SpaceTree<'_>,
+-    agent_numbers: &[String],
++    agent_number: &dyn Fn(&str) -> Option<usize>,
+     show_focus: bool,
+     config: &ClientShellConfig,
+     now_ms: u64,
+@@ -536,10 +616,7 @@ pub(in crate::client::shell) fn render_space_tree(
+         }
+         let x = rect.x.saturating_add(indent).min(rect.right());
+         let width = usize::from(rect.right().saturating_sub(x));
+-        let number = agent_numbers
+-            .iter()
+-            .position(|pane_id| pane_id == item.pane_id)
+-            .filter(|index| *index < 9);
++        let number = agent_number(item.pane_id).filter(|index| *index < 9);
+         if let Some(index) = number.filter(|_| indent >= 2) {
+             put_text(
+                 buffer,
+@@ -829,6 +906,7 @@ pub(in crate::client::shell) struct SpaceTreeState {
+ }
+ 
+ struct LinePress {
++    endpoint_id: ClientEndpointId,
+     pane_id: String,
+     column: u16,
+     row: u16,
+@@ -862,9 +940,16 @@ impl ClientShellState {
+             .map(|(_, endpoint_id, key)| (endpoint_id.clone(), key.clone()))
+     }
+ 
+-    pub(super) fn press_space_line(&mut self, pane_id: String, column: u16, row: u16) {
++    pub(super) fn press_space_line(
++        &mut self,
++        endpoint_id: ClientEndpointId,
++        pane_id: String,
++        column: u16,
++        row: u16,
++    ) {
+         self.space_tree.drag = None;
+         self.space_tree.press = Some(LinePress {
++            endpoint_id,
+             pane_id,
+             column,
+             row,
+@@ -902,7 +987,11 @@ impl ClientShellState {
+                 let Some(press) = self.space_tree.press.as_ref() else {
+                     return false;
+                 };
+-                if press.column == mouse.column && press.row == mouse.row {
++                // Lines only move within the machine being shown; elsewhere, release still
++                // switches to the agent.
++                if (press.column == mouse.column && press.row == mouse.row)
++                    || press.endpoint_id != self.active_endpoint_id
++                {
+                     return true;
+                 }
+                 let pane_id = press.pane_id.clone();
+@@ -926,18 +1015,42 @@ impl ClientShellState {
+                 let Some(press) = self.space_tree.press.take() else {
+                     return false;
+                 };
+-                self.push_endpoint_method(
+-                    crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
+-                        pane_id: press.pane_id,
+-                    }),
+-                    outcome,
+-                );
++                if self.multi_endpoint_active() {
++                    self.focus_or_activate(
++                        press.endpoint_id,
++                        ClientEndpointFocusTarget::Pane(press.pane_id),
++                        outcome,
++                    );
++                } else {
++                    self.push_endpoint_method(
++                        crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
++                            pane_id: press.pane_id,
++                        }),
++                        outcome,
++                    );
++                }
+                 true
+             }
+             _ => false,
+         }
+     }
+ 
++    /// Line hits of the machine being shown: the local sidebar's, or the active
++    /// machine's in the multi-machine sidebar.
++    fn active_lines(&self) -> impl Iterator<Item = (Rect, &str)> {
++        self.hits
++            .agents
++            .iter()
++            .map(|(rect, pane_id)| (*rect, pane_id.as_str()))
++            .chain(
++                self.hits
++                    .endpoint_agents
++                    .iter()
++                    .filter(|(_, endpoint_id, _)| *endpoint_id == self.active_endpoint_id)
++                    .map(|(rect, _, pane_id)| (*rect, pane_id.as_str())),
++            )
++    }
++
+     /// Whether a line hit sits in the space tree rather than the needs-input list.
+     fn in_space_tree(&self, rect: Rect) -> bool {
+         let corner = (rect.x, rect.y);
+@@ -966,14 +1079,12 @@ impl ClientShellState {
+             return into_space(&workspace_id);
+         }
+         let (_, target_pane_id) = self
+-            .hits
+-            .agents
+-            .iter()
++            .active_lines()
+             .find(|(rect, _)| super::contains(*rect, point) && self.in_space_tree(*rect))?;
+         let target = snapshot
+             .panes
+             .iter()
+-            .find(|pane| pane.pane_id == *target_pane_id)?;
++            .find(|pane| pane.pane_id == target_pane_id)?;
+         if target.workspace_id != source.workspace_id {
+             return into_space(&target.workspace_id);
+         }
+@@ -1054,9 +1165,9 @@ impl ClientShellState {
+         let Some(drag) = self.space_tree.drag.as_ref() else {
+             return;
+         };
+-        for (rect, pane_id) in &self.hits.agents {
+-            if *pane_id == drag.pane_id {
+-                buffer.set_style(*rect, Style::default().add_modifier(Modifier::DIM));
++        for (rect, pane_id) in self.active_lines() {
++            if pane_id == drag.pane_id {
++                buffer.set_style(rect, Style::default().add_modifier(Modifier::DIM));
+             }
+         }
+         let target = match drag.target.as_ref() {
+@@ -1069,11 +1180,9 @@ impl ClientShellState {
+                 })
+                 .map(|hit| hit.rect),
+             Some(LineDrop::Tab { target_pane_id, .. }) => self
+-                .hits
+-                .agents
+-                .iter()
++                .active_lines()
+                 .find(|(rect, pane_id)| pane_id == target_pane_id && self.in_space_tree(*rect))
+-                .map(|(rect, _)| *rect),
++                .map(|(rect, _)| rect),
+             None => None,
+         };
+         if let Some(rect) = target {
+@@ -1081,14 +1190,12 @@ impl ClientShellState {
+         }
+     }
+ 
+-    /// Open the space-line menu for the line under (x, y). Local machine only.
++    /// Open the space-line menu for the line under (x, y), on the machine being shown.
+     pub(super) fn open_space_line_menu_at(&mut self, x: u16, y: u16) -> bool {
+         let Some(pane_id) = self
+-            .hits
+-            .agents
+-            .iter()
++            .active_lines()
+             .find(|(rect, _)| super::contains(*rect, (x, y)))
+-            .map(|(_, pane_id)| pane_id.clone())
++            .map(|(_, pane_id)| pane_id.to_owned())
+         else {
+             return false;
+         };
+diff --git a/src/client/shell/tests/space_tree.rs b/src/client/shell/tests/space_tree.rs
+index 1ce99fa5..01574926 100644
+--- a/src/client/shell/tests/space_tree.rs
++++ b/src/client/shell/tests/space_tree.rs
+@@ -318,3 +318,144 @@ fn turns_finished_before_attaching_stay_unread() {
+         .collect::<Vec<_>>();
+     assert!(sidebar.iter().any(|row| row == " finished"), "{sidebar:#?}");
+ }
++
++/// Local and a saved machine "Build", both online, each with the tree snapshot.
++fn multi_machine_state(
++    remote_status: AgentStatus,
++) -> (ClientShellState, crate::client::endpoint::ClientEndpointId) {
++    use crate::client::endpoint::{
++        ClientEndpointId, ClientEndpointStatus, ProfileId, SavedSshEndpoint,
++    };
++    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
++    let profile = SavedSshEndpoint {
++        id: ProfileId::parse("0123456789abcdef0123456789abcdef").expect("profile id"),
++        label: "Build".into(),
++        target: "dev@build.example".into(),
++        session: "agents".into(),
++        enabled: true,
++    };
++    let remote = ClientEndpointId::Ssh(profile.id.clone());
++    state.set_endpoint_catalog(&[profile]);
++    state.set_endpoint_status(&remote, ClientEndpointStatus::Online);
++    state.set_snapshot(Box::new(tree_snapshot()));
++    state.set_pane_surface(surface());
++    let mut remote_snapshot = tree_snapshot();
++    remote_snapshot.boot_id = "remote-boot".into();
++    remote_snapshot.agents[1].agent_status = remote_status;
++    state.set_endpoint_snapshot(&remote, Box::new(remote_snapshot));
++    state.compose(106, 40).expect("frame");
++    (state, remote)
++}
++
++fn machine_line(
++    state: &ClientShellState,
++    endpoint: &crate::client::endpoint::ClientEndpointId,
++    pane_id: &str,
++) -> Rect {
++    state
++        .hits
++        .endpoint_agents
++        .iter()
++        .find(|(rect, id, pane)| {
++            id == endpoint && pane == pane_id && rect.y < state.hits.agent_body.y.max(1)
++        })
++        .or_else(|| {
++            state
++                .hits
++                .endpoint_agents
++                .iter()
++                .find(|(_, id, pane)| id == endpoint && pane == pane_id)
++        })
++        .map(|(rect, _, _)| *rect)
++        .expect("machine tree line")
++}
++
++#[test]
++fn multi_machine_lines_drag_within_the_machine_being_shown() {
++    let (mut state, _) = multi_machine_state(AgentStatus::Working);
++    let local = crate::client::endpoint::ClientEndpointId::Local;
++    let source = machine_line(&state, &local, "pane_2");
++    let destination = state
++        .hits
++        .workspaces
++        .iter()
++        .find(|hit| hit.endpoint_id == local && hit.workspace_id == "ws_2")
++        .map(|hit| hit.rect)
++        .expect("local personal space");
++    mouse(&mut state, MouseEventKind::Down(MouseButton::Left), source);
++    mouse(
++        &mut state,
++        MouseEventKind::Drag(MouseButton::Left),
++        destination,
++    );
++    let up = mouse(
++        &mut state,
++        MouseEventKind::Up(MouseButton::Left),
++        destination,
++    );
++    assert!(matches!(
++        methods(&up)[..],
++        [Method::PaneMove(params)] if params.pane_id == "pane_2"
++    ));
++}
++
++#[test]
++fn multi_machine_click_switches_to_another_machines_agent_on_release() {
++    let (mut state, remote) = multi_machine_state(AgentStatus::Working);
++    let target = machine_line(&state, &remote, "pane_2");
++    let down = mouse(&mut state, MouseEventKind::Down(MouseButton::Left), target);
++    assert!(down.actions.is_empty());
++    // Dragging another machine's line does nothing; release still switches to it.
++    mouse(
++        &mut state,
++        MouseEventKind::Drag(MouseButton::Left),
++        Rect {
++            y: target.y + 1,
++            ..target
++        },
++    );
++    let up = mouse(
++        &mut state,
++        MouseEventKind::Up(MouseButton::Left),
++        Rect {
++            y: target.y + 1,
++            ..target
++        },
++    );
++    assert!(matches!(
++        up.actions.as_slice(),
++        [ClientShellAction::ActivateEndpoint {
++            endpoint_id,
++            target: Some(ClientEndpointFocusTarget::Pane(pane)),
++        }] if *endpoint_id == remote && pane == "pane_2"
++    ));
++}
++
++#[test]
++fn multi_machine_next_agent_goes_to_the_most_urgent_across_machines() {
++    let (mut state, remote) = multi_machine_state(AgentStatus::Blocked);
++    let mut outcome = ClientShellInput::default();
++    assert!(state.handle_endpoint_navigation(crate::input::KeybindAction::NextAgent, &mut outcome));
++    assert!(matches!(
++        outcome.actions.as_slice(),
++        [ClientShellAction::ActivateEndpoint {
++            endpoint_id,
++            target: Some(ClientEndpointFocusTarget::Pane(pane)),
++        }] if *endpoint_id == remote && pane == "pane_2"
++    ));
++    // focus_agent numbers follow the tree: Local's two agents, then Build's.
++    let targets = crate::client::shell::space_agents::endpoint_focus_targets(&state.endpoints);
++    let order = targets
++        .iter()
++        .map(|target| (target.endpoint_id == remote, target.pane_id.as_str()))
++        .collect::<Vec<_>>();
++    assert_eq!(
++        order,
++        [
++            (false, "pane_1"),
++            (false, "pane_2"),
++            (true, "pane_1"),
++            (true, "pane_2")
++        ]
++    );
++}

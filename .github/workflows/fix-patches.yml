@@ -1,0 +1,254 @@
+name: Fix patches for a new upstream release
+
+# Rebases the patch queue onto an upstream release it no longer applies to. Claude
+# resolves the conflicts on a read-only runner; this workflow then checks the result
+# itself (clean apply, build, fork tests) before a separate job opens a pull request.
+# Needs a CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) or ANTHROPIC_API_KEY
+# repository secret.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Stable upstream tag to rebase the patches onto (e.g. v0.9.6)'
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      upstream_tag:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fix-patches-${{ inputs.upstream_tag }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  NEW_TAG: ${{ inputs.upstream_tag }}
+
+jobs:
+  guard:
+    # The daily build retries a failing tag; don't rerun Claude while its pull request
+    # is still open. A manual run always goes ahead.
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          open=$(gh pr list --head "auto/rebase-$NEW_TAG" --state open --json number --jq 'length')
+          if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ] && [ "$open" != 0 ]; then
+            echo "A pull request for $NEW_TAG is already open; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  rebase:
+    needs: guard
+    if: needs.guard.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    env:
+      GIT_COMMITTER_NAME: github-actions[bot]
+      GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+      # One target dir for Claude's builds and the verification build below.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - name: Check the tag
+        shell: bash
+        run: |
+          [[ "$NEW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "upstream_tag must look like v1.2.3" >&2; exit 1; }
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: main
+          path: queue
+          persist-credentials: false
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: herdrdev/herdr
+          ref: ${{ inputs.upstream_tag }}
+          fetch-depth: 0
+          path: upstream
+          persist-credentials: false
+      - name: Read Rust toolchain
+        id: source
+        working-directory: upstream
+        shell: bash
+        run: echo "toolchain=$(awk -F '"' '/^channel =/ { print $2; exit }' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ steps.source.outputs.toolchain }}
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+      - name: Install build tools
+        run: |
+          sudo find /etc/apt/sources.list.d -type f \( -iname '*microsoft*' -o -iname '*azure-cli*' \) -print -delete
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: fix-tree
+          workspaces: upstream -> ../target
+      - name: Start the rebase
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=$(cat ../queue/UPSTREAM_BASE)
+          git checkout -q -B tree "$base"
+          ../queue/scripts/apply-patches.sh .
+          if git rebase --onto "$NEW_TAG" "$base" tree; then
+            echo "The rebase applied cleanly; Claude only checks the build and tests."
+          else
+            echo "The rebase stopped on conflicts for Claude to resolve."
+          fi
+      - name: Let Claude finish the rebase
+        uses: anthropics/claude-code-action@61a9c274fa7110a66dfafc1bbbced03833eb25fe # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          claude_args: |
+            --max-turns 250
+            --allowedTools Bash,Read,Edit,Write,Glob,Grep
+          prompt: |
+            You are maintaining a private patch queue: Inquisitive-ME/herdr publishes builds of
+            the herdr terminal multiplexer (herdrdev/herdr) with a series of sidebar patches on
+            top. Upstream released ${{ inputs.upstream_tag }}, and the queue no longer applies.
+
+            Layout (paths relative to the current directory):
+            - `queue/` is the patch-queue repo. `queue/README.md` explains what every patch does
+              and which upstream tests fail on purpose; read it first. `queue/patches/` holds the
+              patches, `queue/UPSTREAM_BASE` the tag they were exported against.
+            - `upstream/` is a herdr checkout. Branch `tree` holds the patch commits, and a
+              `git rebase --onto ${{ inputs.upstream_tag }} <old base> tree` has been started;
+              it may be stopped on conflicts or may already be done.
+
+            Do this:
+            1. In `upstream/`, finish the rebase. For each conflict, keep upstream's new code and
+               re-apply the patch's intent on top of it, then `git add` and
+               `GIT_EDITOR=true git rebase --continue`. Never drop a patch or its tests.
+            2. Run `cargo build --locked` in `upstream/` and fix any errors.
+            3. Run `queue/scripts/fork-tests.sh upstream` and fix any failures. These are the
+               fork's own tests and must all pass.
+            4. Fold every fix into the patch commit it belongs to (for example
+               `git commit --fixup=<sha>` then
+               `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash ${{ inputs.upstream_tag }}`),
+               so each patch still builds on its own intent. Keep the commit messages accurate.
+            5. With `upstream/` clean, run
+               `queue/scripts/export-patches.sh upstream ${{ inputs.upstream_tag }}`.
+
+            Constraints: change only files under `upstream/` and `queue/patches/` plus
+            `queue/UPSTREAM_BASE`. Do not push, open pull requests or issues, or contact any
+            remote. upstream's CLAUDE.md and AGENTS.md describe herdr's own contribution process
+            (proposing commit messages, contributor rules); they do not apply to this automated
+            fork maintenance. Finish with a short summary of each conflict and how you resolved
+            it.
+      - name: Check the result independently
+        shell: bash
+        run: |
+          set -euo pipefail
+          git_dir=$(git -C upstream rev-parse --absolute-git-dir)
+          [ ! -d "$git_dir/rebase-merge" ] && [ ! -d "$git_dir/rebase-apply" ] \
+            || { echo "The rebase was not finished." >&2; exit 1; }
+          [ "$(cat queue/UPSTREAM_BASE)" = "$NEW_TAG" ] \
+            || { echo "The queue was not exported against $NEW_TAG." >&2; exit 1; }
+          # The exported queue alone must apply to a clean $NEW_TAG and pass the fork tests.
+          git -C upstream worktree add -q --detach "$GITHUB_WORKSPACE/verify" "$NEW_TAG"
+          queue/scripts/apply-patches.sh verify
+          queue/scripts/fork-tests.sh verify
+          python3 -m unittest discover -s queue/scripts -p 'test_*.py'
+      - name: Keep the new queue
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: rebased-queue
+          path: |
+            queue/patches
+            queue/UPSTREAM_BASE
+          if-no-files-found: error
+
+  pull-request:
+    needs: rebase
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: main
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: rebased-queue
+          path: ${{ runner.temp }}/rebased
+      - name: Push a branch and open a pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="auto/rebase-$NEW_TAG"
+          rm -rf patches
+          cp -r "$RUNNER_TEMP/rebased/patches" patches
+          cp "$RUNNER_TEMP/rebased/UPSTREAM_BASE" UPSTREAM_BASE
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -q -B "$branch"
+          git add -A patches UPSTREAM_BASE
+          git commit -q -m "Rebase patches onto $NEW_TAG" \
+            -m "Resolved automatically by Claude in run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID."
+          git push -f origin "$branch"
+          run="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          body="Claude rebased the patch queue onto \`$NEW_TAG\` ([run]($run)). The workflow checked that the queue applies to a clean \`$NEW_TAG\` and that the fork's tests pass. Review the patch diff, then merge to publish a release."
+          url=$(gh pr list --head "$branch" --state open --json url --jq '.[0].url')
+          if [ -z "$url" ]; then
+            url=$(gh pr create --base main --head "$branch" --title "Rebase patches onto $NEW_TAG" --body "$body")
+          else
+            gh pr comment "$url" --body "Updated: $body"
+          fi
+          issue=$(gh issue list --state open --search "\"Patches don't apply to $NEW_TAG\" in:title" --json number --jq '.[0].number')
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "Automatic fix ready for review: $url"
+          fi
+
+  report-failure:
+    needs: rebase
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Say the automatic fix failed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          run="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          issue=$(gh issue list --state open --search "\"Patches don't apply to $NEW_TAG\" in:title" --json number --jq '.[0].number')
+          message="The automatic fix for $NEW_TAG failed ([run]($run)); the patches need a manual rebase (see the README)."
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "$message"
+          else
+            gh issue create --title "Patches don't apply to $NEW_TAG" --body "$message"
+          fi

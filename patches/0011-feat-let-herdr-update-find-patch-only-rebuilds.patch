@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Richard Swanson <rswanson05@gmail.com>
+Date: Sun, 8 Nov 2026 09:13:54 -0600
+Subject: [PATCH] feat: let herdr update find patch-only rebuilds
+
+CI compiles the release tag in as HERDR_FORK_RELEASE and latest.json carries it. A different release of the same upstream version counts as an update; builds without a tag never chase one. herdr --version prints the release.
+
+diff --git a/src/main.rs b/src/main.rs
+index f97e7e2b..fa099f50 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -725,6 +725,9 @@ fn main() -> io::Result<()> {
+     if args.iter().any(|a| a == "--version" || a == "-V") {
+         platform::begin_cli_output();
+         println!("herdr {}", crate::build_info::version());
++        if let Some(release) = crate::update::FORK_RELEASE {
++            println!("release {release}");
++        }
+         return Ok(());
+     }
+ 
+diff --git a/src/update.rs b/src/update.rs
+index 17ddf80c..8b41be51 100644
+--- a/src/update.rs
++++ b/src/update.rs
+@@ -26,6 +26,8 @@ use serde::{Deserialize, Deserializer};
+ const STABLE_UPDATE_MANIFEST_URL: &str =
+     "https://github.com/Inquisitive-ME/herdr/releases/latest/download/latest.json";
+ const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
++/// Fork: the release this binary was built as (e.g. `v0.9.5-tree.21330f2a`), set by CI.
++pub(crate) const FORK_RELEASE: Option<&str> = option_env!("HERDR_FORK_RELEASE");
+ const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
+ const HERDR_UPDATE_COMMAND: &str = "herdr update";
+ const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr";
+@@ -211,6 +213,9 @@ struct UpdateManifest {
+     announcement: Option<serde_json::Value>,
+     #[serde(default, deserialize_with = "deserialize_manifest_releases")]
+     releases: BTreeMap<String, serde_json::Value>,
++    /// Fork: the release tag, so rebuilds of the same upstream version are updates too.
++    #[serde(default)]
++    release: Option<String>,
+ }
+ 
+ fn deserialize_manifest_releases<'de, D>(
+@@ -388,7 +393,9 @@ fn release_info_from_manifest(manifest: &UpdateManifest) -> Result<Option<Releas
+     let latest = Version::parse(&manifest.version)
+         .ok_or_else(|| format!("invalid version in update manifest: {}", manifest.version))?;
+ 
+-    if !stable_channel_should_install(&latest, &current, crate::build_info::is_preview()) {
++    if !stable_channel_should_install(&latest, &current, crate::build_info::is_preview())
++        && !fork_rebuild_available(&latest, &current, manifest.release.as_deref(), FORK_RELEASE)
++    {
+         return Ok(None); // up to date
+     }
+ 
+@@ -441,6 +448,20 @@ fn stable_channel_should_install(
+     installed_is_preview || latest > current
+ }
+ 
++/// Fork: a new patch release of the same upstream version. Builds without a release
++/// tag (local builds) never chase one.
++fn fork_rebuild_available(
++    latest: &Version,
++    current: &Version,
++    latest_release: Option<&str>,
++    installed_release: Option<&str>,
++) -> bool {
++    latest == current
++        && installed_release
++            .zip(latest_release)
++            .is_some_and(|(installed, latest)| installed != latest)
++}
++
+ fn preview_display_version(base_version: &str, build_id: &str) -> String {
+     format!(
+         "{}-preview.{}",
+@@ -3824,6 +3845,45 @@ mod tests {
+         assert_eq!(release.download_url, "https://example.com/herdr");
+     }
+ 
++    /// Fork: a new patch release of the installed upstream version is an update.
++    #[test]
++    fn fork_rebuild_of_the_same_version_is_an_update() {
++        let v = |text| Version::parse(text).unwrap();
++        let tree = |hash: &'static str| Some(hash);
++        assert!(fork_rebuild_available(
++            &v("0.9.5"),
++            &v("0.9.5"),
++            tree("v0.9.5-tree.b"),
++            tree("v0.9.5-tree.a")
++        ));
++        assert!(!fork_rebuild_available(
++            &v("0.9.5"),
++            &v("0.9.5"),
++            tree("v0.9.5-tree.a"),
++            tree("v0.9.5-tree.a")
++        ));
++        // Local builds have no release tag and never chase one; nor do old manifests.
++        assert!(!fork_rebuild_available(
++            &v("0.9.5"),
++            &v("0.9.5"),
++            tree("v0.9.5-tree.b"),
++            None
++        ));
++        assert!(!fork_rebuild_available(
++            &v("0.9.5"),
++            &v("0.9.5"),
++            None,
++            tree("v0.9.5-tree.a")
++        ));
++        // Other versions are left to the normal version comparison.
++        assert!(!fork_rebuild_available(
++            &v("0.9.4"),
++            &v("0.9.5"),
++            tree("v0.9.4-tree.b"),
++            tree("v0.9.5-tree.a")
++        ));
++    }
++
+     #[test]
+     fn stable_channel_installs_stable_asset_when_current_binary_is_preview() {
+         let latest_stable = Version::parse("0.6.6").unwrap();

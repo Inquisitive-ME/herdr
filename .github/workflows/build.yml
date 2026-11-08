@@ -287,6 +287,9 @@ jobs:
         shell: bash
         run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
       - name: Build
+        env:
+          # Lets `herdr update` tell rebuilds of the same upstream version apart.
+          HERDR_FORK_RELEASE: ${{ needs.plan.outputs.release_tag }}
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package artifact
         shell: bash
@@ -298,8 +301,77 @@ jobs:
           path: upstream/${{ matrix.name }}
           if-no-files-found: error
 
+  test:
+    needs: [plan, check-patches]
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: upstream
+    env:
+      GIT_COMMITTER_NAME: github-actions[bot]
+      GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: queue
+          persist-credentials: false
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: herdrdev/herdr
+          ref: ${{ needs.plan.outputs.upstream_tag }}
+          fetch-depth: 0
+          path: upstream
+          persist-credentials: false
+      - name: Apply patches
+        shell: bash
+        run: ../queue/scripts/apply-patches.sh .
+      - name: Read Rust toolchain
+        id: source
+        shell: bash
+        run: echo "toolchain=$(awk -F '"' '/^channel =/ { print $2; exit }' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ steps.source.outputs.toolchain }}
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+      - name: Install build tools
+        run: |
+          sudo find /etc/apt/sources.list.d -type f \( -iname '*microsoft*' -o -iname '*azure-cli*' \) -print -delete
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: test-tree
+          workspaces: upstream -> target
+      - name: Run the fork's tests
+        shell: bash
+        run: ../queue/scripts/fork-tests.sh .
+      - name: Run the queue's script tests
+        working-directory: queue
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
+  fix:
+    # Patches stopped applying to a new upstream release: let Claude rebase them and
+    # open a pull request with the result.
+    needs: [plan, check-patches]
+    if: always() && needs.plan.outputs.build == 'true' && needs.check-patches.result == 'failure'
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    uses: ./.github/workflows/fix-patches.yml
+    with:
+      upstream_tag: ${{ needs.plan.outputs.upstream_tag }}
+    secrets: inherit
+
   publish:
-    needs: [plan, build]
+    needs: [plan, build, test]
     if: needs.plan.outputs.build == 'true'
     runs-on: ubuntu-latest
     permissions:

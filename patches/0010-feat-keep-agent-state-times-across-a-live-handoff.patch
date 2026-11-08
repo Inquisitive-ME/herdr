@@ -1,0 +1,215 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Richard Swanson <rswanson05@gmail.com>
+Date: Sun, 8 Nov 2026 09:13:54 -0600
+Subject: [PATCH] feat: keep agent state times across a live handoff
+
+The handoff manifest carries each agent's state and when it began. When detection re-finds the same state after the handoff, the original start time is kept.
+
+diff --git a/src/app/actions.rs b/src/app/actions.rs
+index 503c8fd4..9fe15686 100644
+--- a/src/app/actions.rs
++++ b/src/app/actions.rs
+@@ -1756,10 +1756,13 @@ impl AppState {
+             self.next_agent_state_change_seq += 1;
+             if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                 terminal.last_agent_state_change_seq = Some(self.next_agent_state_change_seq);
+-                terminal.agent_state_since_unix_ms = std::time::SystemTime::now()
+-                    .duration_since(std::time::UNIX_EPOCH)
+-                    .ok()
+-                    .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
++                terminal.begin_agent_state(
++                    change.state,
++                    std::time::SystemTime::now()
++                        .duration_since(std::time::UNIX_EPOCH)
++                        .ok()
++                        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
++                );
+                 terminal.last_agent_completion_seq = (!suppress_completion
+                     && is_completion_transition(&change))
+                 .then_some(self.next_agent_state_change_seq);
+@@ -3169,6 +3172,48 @@ mod tests {
+         app.assert_invariants_for_test();
+     }
+ 
++    /// Fork: after a handoff, re-detecting the same state keeps its original start.
++    #[test]
++    fn handoff_keeps_the_start_of_a_redetected_state() {
++        let mut app = app_with_workspaces(&["active"]);
++        let pane_id = app.workspaces[0].tabs[0].root_pane;
++        let terminal_id = app.workspaces[0].panes[&pane_id]
++            .attached_terminal_id
++            .clone();
++        app.terminals
++            .get_mut(&terminal_id)
++            .expect("terminal")
++            .restore_handoff_state_since(Some((AgentState::Working, 42)));
++        let change = |app: &mut AppState, state| {
++            app.handle_app_event(AppEvent::StateChanged {
++                pane_id,
++                agent: Some(Agent::Pi),
++                state,
++                visible_blocker: false,
++                visible_working: state == AgentState::Working,
++                process_exited: false,
++                observed_at: Instant::now(),
++            });
++        };
++        change(&mut app, AgentState::Working);
++        assert_eq!(
++            app.terminals[&terminal_id].agent_state_since_unix_ms,
++            Some(42)
++        );
++        change(&mut app, AgentState::Idle);
++        assert!(app.terminals[&terminal_id]
++            .agent_state_since_unix_ms
++            .is_some_and(|since| since > 42));
++
++        // A different state after the handoff starts fresh.
++        let terminal = app.terminals.get_mut(&terminal_id).expect("terminal");
++        terminal.restore_handoff_state_since(Some((AgentState::Blocked, 7)));
++        change(&mut app, AgentState::Working);
++        assert!(app.terminals[&terminal_id]
++            .agent_state_since_unix_ms
++            .is_some_and(|since| since > 42));
++    }
++
+     /// Fork: agents carry when their current state began, for the sidebar's ages.
+     #[test]
+     fn state_changes_record_when_the_state_began() {
+diff --git a/src/handoff_runtime.rs b/src/handoff_runtime.rs
+index 12481f6d..f9c87e78 100644
+--- a/src/handoff_runtime.rs
++++ b/src/handoff_runtime.rs
+@@ -29,6 +29,9 @@ pub(crate) struct HandoffRuntimeState {
+     pub initial_history_ansi: Option<String>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub agent_state: Option<crate::terminal::state::HandoffAgentState>,
++    /// Fork: the agent's state and when it began (Unix ms), so ages survive a handoff.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub fork_state_since: Option<(crate::detect::AgentState, u64)>,
+ }
+ 
+ #[cfg(unix)]
+diff --git a/src/pane.rs b/src/pane.rs
+index f80baeb8..aa39a11f 100644
+--- a/src/pane.rs
++++ b/src/pane.rs
+@@ -2311,6 +2311,7 @@ impl PaneRuntime {
+             terminal_title: self.terminal_title(),
+             initial_history_ansi: None,
+             agent_state: None,
++            fork_state_since: None,
+         }
+     }
+ 
+@@ -2522,6 +2523,7 @@ impl PaneRuntime {
+             terminal_title,
+             initial_history_ansi,
+             agent_state: _,
++            fork_state_since: _,
+         } = state;
+         let pane_id = PaneId::from_raw(pane_id);
+         use std::os::fd::FromRawFd;
+diff --git a/src/persist/restore.rs b/src/persist/restore.rs
+index a8c6fd35..f1bffd56 100644
+--- a/src/persist/restore.rs
++++ b/src/persist/restore.rs
+@@ -584,6 +584,10 @@ fn restore_tab(
+         let handoff_agent_state = imported_runtime
+             .as_ref()
+             .and_then(|imported| imported.state.agent_state.clone());
++        #[cfg(unix)]
++        let handoff_state_since = imported_runtime
++            .as_ref()
++            .and_then(|imported| imported.state.fork_state_since);
+         let pending_native_agent_restore = if was_imported {
+             None
+         } else {
+@@ -726,6 +730,8 @@ fn restore_tab(
+                 if let Some(agent_state) = handoff_agent_state {
+                     terminal.restore_handoff_agent_state(agent_state);
+                 }
++                #[cfg(unix)]
++                terminal.restore_handoff_state_since(handoff_state_since);
+                 panes.insert(*id, PaneState::new(terminal_id.clone()));
+                 terminal_runtimes.insert(terminal_id, runtime);
+                 terminals.push(terminal);
+diff --git a/src/server/headless/lifecycle.rs b/src/server/headless/lifecycle.rs
+index 8c6587ff..ce965c99 100644
+--- a/src/server/headless/lifecycle.rs
++++ b/src/server/headless/lifecycle.rs
+@@ -89,6 +89,16 @@ impl HeadlessServer {
+                 .terminals
+                 .get(terminal_id)
+                 .and_then(|terminal| terminal.handoff_agent_state());
++            handoff_runtime.fork_state_since =
++                self.app
++                    .state
++                    .terminals
++                    .get(terminal_id)
++                    .and_then(|terminal| {
++                        terminal
++                            .agent_state_since_unix_ms
++                            .map(|since| (terminal.state, since))
++                    });
+             let has_agent_session = self
+                 .app
+                 .state
+diff --git a/src/terminal/state.rs b/src/terminal/state.rs
+index 5d381390..82f14f3b 100644
+--- a/src/terminal/state.rs
++++ b/src/terminal/state.rs
+@@ -157,6 +157,8 @@ pub struct TerminalState {
+     pub last_agent_completion_seq: Option<u64>,
+     /// Fork: wall-clock time of the last agent state change, in Unix milliseconds.
+     pub agent_state_since_unix_ms: Option<u64>,
++    /// Fork: the state and start time carried over a handoff until detection catches up.
++    pub handoff_state_since: Option<(AgentState, u64)>,
+     pub revision: u64,
+     pub launch_argv: Option<Vec<String>>,
+     pub respawn_shell_on_exit: bool,
+@@ -197,6 +199,7 @@ impl TerminalState {
+             state: AgentState::Unknown,
+             last_agent_state_change_seq: None,
+             agent_state_since_unix_ms: None,
++            handoff_state_since: None,
+             last_agent_completion_seq: None,
+             revision: 0,
+             launch_argv: None,
+@@ -257,6 +260,28 @@ impl TerminalState {
+         self.agent_process_acquisition_pending = snapshot.acquisition_pending;
+     }
+ 
++    /// Fork: keep the pre-handoff start time when the state is already known, or
++    /// remember it until detection re-finds the same state after the handoff.
++    pub(crate) fn restore_handoff_state_since(&mut self, carried: Option<(AgentState, u64)>) {
++        let Some((state, since)) = carried else {
++            return;
++        };
++        if self.state == state {
++            self.agent_state_since_unix_ms = Some(since);
++        } else {
++            self.handoff_state_since = Some((state, since));
++        }
++    }
++
++    /// Fork: when a new state began; the carried handoff time if detection just
++    /// re-found the state the agent had before the handoff.
++    pub(crate) fn begin_agent_state(&mut self, state: AgentState, now_unix_ms: Option<u64>) {
++        self.agent_state_since_unix_ms = match self.handoff_state_since.take() {
++            Some((carried, since)) if carried == state => Some(since),
++            _ => now_unix_ms,
++        };
++    }
++
+     pub(crate) fn finish_agent_process_acquisition(&mut self) -> bool {
+         let reached_idle = self.agent_process_acquisition_pending && self.state == AgentState::Idle;
+         let suppress_completion = reached_idle && self.recent_agent_process_exit.is_none();
+@@ -2342,6 +2367,7 @@ impl TerminalState {
+         self.last_agent_state_change_seq = None;
+         self.last_agent_completion_seq = None;
+         self.agent_state_since_unix_ms = None;
++        self.handoff_state_since = None;
+         self.launch_argv = None;
+         self.respawn_shell_on_exit = false;
+         self.recent_agent_process_exit = None;
