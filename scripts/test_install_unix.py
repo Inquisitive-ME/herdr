@@ -76,7 +76,8 @@ esac
         keys = ("linux-x86_64", "linux-aarch64", "macos-x86_64", "macos-aarch64")
         self.snapshot.write_text(json.dumps({
             "version": "0.9.5",
-            "assets": {k: f"https://example.invalid/herdr-{k}" for k in keys},
+            "assets": {k: getattr(self, "snapshot_urls", "https://example.invalid/herdr-{}").format(k)
+                       for k in keys},
             "sha256": {k: self.checksum.upper() if checksum is None else checksum for k in keys},
         }, indent=2) + "\n")
         # Tests may run inside herdr; don't let its environment leak into the installer.
@@ -122,6 +123,12 @@ esac
                     self.assertEqual((self.install / "herdr").read_bytes(), self.payload.read_bytes())
                     self.assertIn("v0.9.5", result.stdout)
                     self.assertFalse(list(self.install.glob(".herdr.*")))
+
+    def test_reports_the_release_tag_from_the_asset_url(self):
+        self.snapshot_urls = "https://github.com/Inquisitive-ME/herdr/releases/download/v0.9.5-tree.abcd1234/herdr-{}"
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("installed herdr v0.9.5-tree.abcd1234", result.stdout)
 
     def test_existing_path_executable_is_replaced_atomically(self):
         installed = self.bin / "herdr"

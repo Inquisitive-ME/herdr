@@ -72,6 +72,11 @@ install_herdr() {
     [ -n "$URL" ] || err "no build for $TARGET (this fork builds Linux x86_64/aarch64 and Apple Silicon macOS)"
     case "$URL" in https://*) ;; *) err "asset URL must use HTTPS" ;; esac
     [ -n "$VERSION" ] || err "manifest has no version"
+    # Name the build by its release tag (e.g. v0.9.5-tree.21330f2a), not just the version.
+    case "$URL" in
+        */releases/download/*/*) RELEASE=$(printf '%s\n' "$URL" | awk -F/ '{ print $(NF - 1) }') ;;
+        *) RELEASE="v$VERSION" ;;
+    esac
     [ "${#SHA256}" -eq 64 ] || err "manifest has no valid SHA-256 for $TARGET"
     case "$SHA256" in *[!0-9a-fA-F]*) err "invalid SHA-256 for $TARGET" ;; esac
     SHA256=$(printf '%s\n' "$SHA256" | awk '{print tolower($0)}')
@@ -102,7 +107,7 @@ install_herdr() {
 
     # Staging on the destination filesystem lets rename replace a running executable.
     TMP=$(mktemp "$INSTALL_DIR/.herdr.XXXXXXXX")
-    log "downloading v$VERSION..."
+    log "downloading $RELEASE..."
     curl -fsSL --retry 3 --connect-timeout 10 --max-time 120 "$URL" -o "$TMP" \
         || err "download failed from $URL"
     case "$SHA256_TOOL" in
@@ -113,7 +118,7 @@ install_herdr() {
     [ "$ACTUAL_SHA256" = "$SHA256" ] || err "SHA-256 mismatch; download was not installed"
     chmod 755 "$TMP"
     mv -f "$TMP" "$INSTALL_PATH"
-    log "installed herdr v$VERSION to $INSTALL_PATH"
+    log "installed herdr $RELEASE to $INSTALL_PATH"
     case ":$PATH:" in
         *":$INSTALL_DIR:"*) ;;
         *) printf 'Add this to your shell config:\n  export PATH="%s:$PATH"\n' "$INSTALL_DIR" ;;

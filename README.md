@@ -56,11 +56,62 @@ The patches in `patches/`:
 Builds: Linux x86_64, Linux ARM (aarch64) and Apple Silicon macOS. There are no
 Windows or Intel Mac builds; use upstream herdr there.
 
-Install:
+## Install
+
+Everything, on Linux or an Apple Silicon Mac:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Inquisitive-ME/herdr/main/install.sh | sh -s -- --with-shell-count --with-asking
+```
+
+Just herdr, without the extras:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Inquisitive-ME/herdr/main/install.sh | sh
 ```
+
+Releases are named `v<upstream version>-tree.<patch set>`, e.g. `v0.9.5-tree.21330f2a`;
+the installer prints the one it installed. `herdr --version` shows only the upstream
+version.
+
+If herdr was already running, its server keeps the old binary. Swap it without
+stopping your agents (macOS and Linux), from a terminal outside herdr:
+
+```sh
+herdr server live-handoff --import-exe "$(command -v herdr)"
+```
+
+Then detach (`Ctrl+b q`) and run `herdr` again to load the new sidebar. With no
+agents worth keeping, `herdr server stop` and starting `herdr` works too.
+
+If herdr came from Homebrew, run `brew uninstall herdr` first so Homebrew doesn't
+put upstream back.
+
+### Config for the sidebar features
+
+These go in `~/.config/herdr/config.toml`; none are required:
+
+```toml
+[ui]
+# Let the sidebar's right edge drag wider than the default 36 columns.
+sidebar_max_width = 60
+
+[keys]
+next_agent = "prefix+a"            # next agent needing input, then unread finished
+previous_agent = "prefix+shift+a"
+focus_agent = "prefix+alt+1..9"    # also numbers the agents in the sidebar
+
+# Needs-input rows: where the agent is, then what it's asking (--with-asking).
+[ui.sidebar.agents]
+rows = [
+  ["state_icon", "workspace", "tab"],
+  [{ token = "$asking", dim = true }],
+]
+```
+
+Run `herdr config check` after editing.
+
+### Options
 
 The installer verifies the SHA-256 checksum and replaces the `herdr` on PATH
 atomically (a running herdr keeps working), or installs to `~/.local/bin/herdr`
@@ -79,9 +130,12 @@ Options go after `sh -s --` when piping, e.g. `... | sh -s -- --with-shell-count
   herdr. Add `--purge` to also delete `~/.config/herdr` (config, saved sessions,
   logs) and `--yes` to skip the question.
 
-After the first patched install, `herdr update` follows this repository's
-`latest.json`. Upstream compares the Cargo version, so patch-only rebuilds of the same version
-require rerunning the installer.
+### Updating
+
+Rerun the install command; it also updates any installed extras. `herdr update`
+follows this repository's `latest.json` but only notices new upstream versions,
+because it compares the upstream version number, so it misses patch-only rebuilds
+like `tree.7aa748df` to `tree.21330f2a`.
 
 CI checks daily and on queue/script changes. It picks the latest published stable
 upstream version and publishes `<upstream_tag>-tree.<8-digit-patch-sha256>`.
