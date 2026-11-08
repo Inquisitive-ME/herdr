@@ -1,0 +1,299 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Richard Swanson <rswanson05@gmail.com>
+Date: Sat, 7 Nov 2026 22:05:29 -0600
+Subject: [PATCH] feat: place the needs-input section right under the spaces
+ list
+
+When the spaces list leaves room, the needs-input section sits directly
+under it and moves as spaces and agents come and go. It only drops to
+the bottom, with the spaces list scrolling, when there is not enough
+room.
+
+diff --git a/src/client/shell/endpoint_sidebar.rs b/src/client/shell/endpoint_sidebar.rs
+index e094164b..1e2305d3 100644
+--- a/src/client/shell/endpoint_sidebar.rs
++++ b/src/client/shell/endpoint_sidebar.rs
+@@ -249,28 +249,6 @@ pub(super) fn render_expanded(
+     } else {
+         Rect::new(area.right().saturating_sub(1), area.y, 1, area.height)
+     };
+-    // Fork: the agent section only shows agents needing input, so it sizes itself.
+-    let (workspace_area, detail_area, section_divider) = super::space_agents::sidebar_sections(
+-        area,
+-        state.sidebar_section_split,
+-        super::endpoint_agents::needs_input_height(
+-            state.endpoints,
+-            state.active_endpoint_id,
+-            config,
+-        ),
+-    );
+-    hits.sidebar_section_divider = section_divider;
+-    put_text(
+-        buffer,
+-        workspace_area.x,
+-        workspace_area.y,
+-        workspace_area.width,
+-        " machines",
+-        Style::default()
+-            .fg(palette.overlay0)
+-            .add_modifier(Modifier::BOLD),
+-    );
+-
+     let empty_collapsed_groups = HashSet::new();
+ 
+     enum Row {
+@@ -299,15 +277,6 @@ pub(super) fn render_expanded(
+             );
+         }
+     }
+-    let body = Rect::new(
+-        workspace_area.x,
+-        workspace_area.y.saturating_add(WORKSPACE_HEADER_ROWS),
+-        workspace_area.width,
+-        workspace_area
+-            .height
+-            .saturating_sub(WORKSPACE_HEADER_ROWS + 1),
+-    );
+-    hits.workspace_body = body;
+     let row_heights = rows
+         .iter()
+         .map(|row| match row {
+@@ -359,6 +328,38 @@ pub(super) fn render_expanded(
+             _ => 0,
+         })
+         .collect::<Vec<_>>();
++    // Fork: the agent section only shows agents needing input. It sits right under the
++    // machines list when that fits, otherwise at the bottom.
++    let (workspace_area, detail_area, section_divider) = super::space_agents::sidebar_sections(
++        area,
++        state.sidebar_section_split,
++        super::endpoint_agents::needs_input_height(
++            state.endpoints,
++            state.active_endpoint_id,
++            config,
++        ),
++        super::space_agents::list_content_height(&row_heights, &gaps),
++    );
++    hits.sidebar_section_divider = section_divider;
++    put_text(
++        buffer,
++        workspace_area.x,
++        workspace_area.y,
++        workspace_area.width,
++        " machines",
++        Style::default()
++            .fg(palette.overlay0)
++            .add_modifier(Modifier::BOLD),
++    );
++    let body = Rect::new(
++        workspace_area.x,
++        workspace_area.y.saturating_add(WORKSPACE_HEADER_ROWS),
++        workspace_area.width,
++        workspace_area
++            .height
++            .saturating_sub(WORKSPACE_HEADER_ROWS + 1),
++    );
++    hits.workspace_body = body;
+     let reveal_navigation = !body.is_empty() && std::mem::take(state.reveal_navigation_workspace);
+     let reveal_focus = !body.is_empty() && std::mem::take(state.reveal_focused_workspace);
+     if reveal_navigation || reveal_focus {
+diff --git a/src/client/shell/sidebar.rs b/src/client/shell/sidebar.rs
+index ed70dfb7..3f00891a 100644
+--- a/src/client/shell/sidebar.rs
++++ b/src/client/shell/sidebar.rs
+@@ -211,34 +211,7 @@ pub(crate) fn render_sidebar(
+     } else {
+         Rect::new(area.right().saturating_sub(1), area.y, 1, area.height)
+     };
+-    // Fork: the agent section only shows agents needing input, so it sizes itself.
+-    let (workspace_area, detail_area, section_divider) = space_agents::sidebar_sections(
+-        area,
+-        state.sidebar_section_split,
+-        space_agents::local_needs_input_height(snapshot, config),
+-    );
+-    hits.sidebar_section_divider = section_divider;
+-    put_text(
+-        buffer,
+-        workspace_area.x,
+-        workspace_area.y,
+-        workspace_area.width,
+-        " spaces",
+-        Style::default()
+-            .fg(palette.overlay0)
+-            .add_modifier(Modifier::BOLD),
+-    );
+-
+     let entries = workspace_entries(snapshot, state.collapsed_groups);
+-    let body = Rect::new(
+-        workspace_area.x,
+-        workspace_area.y.saturating_add(WORKSPACE_HEADER_ROWS),
+-        workspace_area.width,
+-        workspace_area
+-            .height
+-            .saturating_sub(WORKSPACE_HEADER_ROWS + 1),
+-    );
+-    hits.workspace_body = body;
+     let row_heights = entries
+         .iter()
+         .map(|entry| {
+@@ -272,6 +245,34 @@ pub(crate) fn render_sidebar(
+                 .map_or(0, |next| u16::from(!next.indented) * config.spaces.row_gap)
+         })
+         .collect::<Vec<_>>();
++    // Fork: the agent section only shows agents needing input. It sits right under the
++    // spaces list when that fits, otherwise at the bottom.
++    let (workspace_area, detail_area, section_divider) = space_agents::sidebar_sections(
++        area,
++        state.sidebar_section_split,
++        space_agents::local_needs_input_height(snapshot, config),
++        space_agents::list_content_height(&row_heights, &gaps),
++    );
++    hits.sidebar_section_divider = section_divider;
++    put_text(
++        buffer,
++        workspace_area.x,
++        workspace_area.y,
++        workspace_area.width,
++        " spaces",
++        Style::default()
++            .fg(palette.overlay0)
++            .add_modifier(Modifier::BOLD),
++    );
++    let body = Rect::new(
++        workspace_area.x,
++        workspace_area.y.saturating_add(WORKSPACE_HEADER_ROWS),
++        workspace_area.width,
++        workspace_area
++            .height
++            .saturating_sub(WORKSPACE_HEADER_ROWS + 1),
++    );
++    hits.workspace_body = body;
+     let mut metrics = super::scroll::list_scroll_metrics(
+         &row_heights,
+         &gaps,
+diff --git a/src/client/shell/space_agents.rs b/src/client/shell/space_agents.rs
+index 61175b8e..abf97d94 100644
+--- a/src/client/shell/space_agents.rs
++++ b/src/client/shell/space_agents.rs
+@@ -159,14 +159,25 @@ pub(in crate::client::shell) fn local_needs_input_height(
+     )
+ }
+ 
++/// Total rows of a sidebar list from its per-entry heights and the gaps after each entry.
++pub(in crate::client::shell) fn list_content_height(heights: &[u16], gaps: &[u16]) -> u16 {
++    heights
++        .iter()
++        .chain(gaps)
++        .fold(0u16, |total, rows| total.saturating_add(*rows))
++}
++
+ /// Split the expanded sidebar into (spaces, needs input, divider). The needs-input
+-/// section takes room only while an agent needs input: just enough for its rows, up to
+-/// the user's draggable split. Without it, the bottom row stays free for the sidebar's
+-/// collapse toggle and there is no divider to drag.
++/// section takes room only while an agent needs input. When the spaces list
++/// (`spaces_list_height` rows) leaves enough room, it sits right under the list, above
++/// the spaces footer. Otherwise it takes the bottom, just big enough for its rows and
++/// up to the user's draggable split, and the spaces list scrolls. The sidebar's last
++/// row stays free for the collapse toggle whenever the section isn't at the bottom.
+ pub(in crate::client::shell) fn sidebar_sections(
+     area: Rect,
+     split_ratio: f32,
+     needs_input_height: u16,
++    spaces_list_height: u16,
+ ) -> (Rect, Rect, Rect) {
+     let (upstream_spaces, upstream_detail) =
+         crate::ui::expanded_sidebar_sections(area, split_ratio);
+@@ -174,19 +185,32 @@ pub(in crate::client::shell) fn sidebar_sections(
+     if content.is_empty() {
+         return (Rect::default(), Rect::default(), Rect::default());
+     }
++    let full_spaces = Rect::new(
++        content.x,
++        content.y,
++        content.width,
++        content.height.saturating_sub(1),
++    );
+     if needs_input_height == 0 {
+-        let spaces = Rect::new(
++        let detail = Rect::new(content.x, full_spaces.bottom(), content.width, 0);
++        return (full_spaces, detail, Rect::default());
++    }
++    let wanted = NEEDS_INPUT_HEADER_ROWS.saturating_add(needs_input_height);
++    // Spaces header, list, this section and the spaces footer row.
++    let inline_rows = WORKSPACE_HEADER_ROWS
++        .saturating_add(spaces_list_height)
++        .saturating_add(wanted)
++        .saturating_add(1);
++    if inline_rows <= full_spaces.height {
++        let detail = Rect::new(
+             content.x,
+-            content.y,
++            full_spaces.y + WORKSPACE_HEADER_ROWS + spaces_list_height,
+             content.width,
+-            content.height.saturating_sub(1),
++            wanted,
+         );
+-        let detail = Rect::new(content.x, spaces.bottom(), content.width, 0);
+-        return (spaces, detail, Rect::default());
++        return (full_spaces, detail, Rect::default());
+     }
+-    let detail_height = NEEDS_INPUT_HEADER_ROWS
+-        .saturating_add(needs_input_height)
+-        .min(upstream_detail.height);
++    let detail_height = wanted.min(upstream_detail.height);
+     let spaces_height = content.height.saturating_sub(detail_height);
+     let spaces = Rect::new(content.x, content.y, content.width, spaces_height);
+     let detail = Rect::new(content.x, spaces.bottom(), content.width, detail_height);
+@@ -259,26 +283,46 @@ mod tests {
+         assert_eq!(list_height([2, 0, 3].into_iter(), 1), 2 + 1 + 1 + 1 + 3);
+     }
+ 
++    #[test]
++    fn list_content_height_sums_heights_and_gaps() {
++        assert_eq!(list_content_height(&[], &[]), 0);
++        assert_eq!(list_content_height(&[3, 2, 4], &[1, 1, 0]), 11);
++    }
++
+     #[test]
+     fn sections_give_spaces_everything_but_the_toggle_row_without_waiting_agents() {
+         let area = Rect::new(0, 0, 27, 40);
+-        let (spaces, detail, divider) = sidebar_sections(area, 0.5, 0);
++        let (spaces, detail, divider) = sidebar_sections(area, 0.5, 0, 10);
+         assert_eq!(spaces, Rect::new(0, 0, 26, 39));
+         assert_eq!(detail.height, 0);
+         assert!(divider.is_empty());
+     }
+ 
+     #[test]
+-    fn needs_input_section_fits_its_rows_up_to_the_split() {
++    fn needs_input_section_sits_right_under_a_short_spaces_list() {
++        let area = Rect::new(0, 0, 27, 40);
++        let (spaces, detail, divider) = sidebar_sections(area, 0.5, 4, 10);
++        assert_eq!(spaces, Rect::new(0, 0, 26, 39));
++        // 2 header rows + 10 list rows, then 3 header rows + 4 agent rows.
++        assert_eq!(detail, Rect::new(0, 12, 26, 7));
++        assert!(divider.is_empty());
++
++        // Exactly fits: 2 + 29 + 7 + 1 footer = 39.
++        let (_, detail, _) = sidebar_sections(area, 0.5, 4, 29);
++        assert_eq!(detail, Rect::new(0, 31, 26, 7));
++    }
++
++    #[test]
++    fn needs_input_section_moves_to_the_bottom_when_spaces_overflow() {
+         let area = Rect::new(0, 0, 27, 40);
+-        let (spaces, detail, divider) = sidebar_sections(area, 0.5, 4);
++        let (spaces, detail, divider) = sidebar_sections(area, 0.5, 4, 30);
+         assert_eq!(detail, Rect::new(0, 33, 26, 7));
+         assert_eq!(spaces.height + detail.height, 40);
+         assert_eq!(divider, Rect::new(0, 33, 26, 1));
+ 
+-        let (_, detail, _) = sidebar_sections(area, 0.5, 100);
++        let (_, detail, _) = sidebar_sections(area, 0.5, 100, 30);
+         assert_eq!(detail.height, 20);
+-        let (_, detail, _) = sidebar_sections(area, 0.25, 100);
++        let (_, detail, _) = sidebar_sections(area, 0.25, 100, 30);
+         assert_eq!(detail.height, 30);
+     }
+ }

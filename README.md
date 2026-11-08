@@ -19,6 +19,9 @@ The patches in `patches/`:
    commands. The count comes from the watcher in
    [`extras/shell-count`](extras/shell-count), which runs as a user service on the
    machine where herdr's server runs.
+4. **Needs input under the list.** The needs-input section sits right under the
+   spaces list and moves with it, dropping to the bottom only when the list is too
+   long to leave room.
 
 Builds: Linux x86_64, Linux ARM (aarch64) and Apple Silicon macOS. There are no
 Windows or Intel Mac builds; use upstream herdr there.
