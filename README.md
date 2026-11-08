@@ -6,81 +6,61 @@ CI, not an upstream source checkout.
 
 The patches in `patches/`:
 
-1. **Agents under their space.** Each space in the sidebar lists its agents
-   underneath, and clicking one jumps to that agent. The agent section below only
-   shows agents that need input and only appears while one does. Most of the code
-   is in a new file (`src/client/shell/space_agents.rs`) so upstream changes rarely
-   conflict with it. Upstream's sidebar tests for the replaced agent list, sort
-   toggle and fixed divider fail with this patch; that is expected and CI does not
-   run them.
-2. **Updates from this repo.** `herdr update`, background version checks and
-   remote installs read this repository's `latest.json` instead of herdr.dev.
-3. **Shell counts.** Agent lines show `· N shells` when the agent is running shell
-   commands. The count comes from the watcher in
-   [`extras/shell-count`](extras/shell-count), which runs as a user service on the
-   machine where herdr's server runs.
-4. **Needs input under the list.** The needs-input section sits right under the
-   spaces list and moves with it, dropping to the bottom only when the list is too
-   long to leave room.
-5. **State times and pane moves (server).** Agents carry a `state_since_ms` token
-   with when their current state began, and clients may call `pane.move`. This
-   changes the server, so a running server needs a restart or
-   `herdr server live-handoff --import-exe <new herdr>` (keeps agents running) to
-   pick it up. Older servers just show no ages and refuse cross-space drags.
-6. **Organized space tree.**
-   - The ▾ at the right of a space collapses it to one summary row of status
-     counts (`●2 ✓1 $2`); clicking the summary expands it again.
+1. **Updates from this repo.** `herdr update`, background version checks and remote
+   installs read this repository's `latest.json` instead of herdr.dev. CI compiles the
+   release tag in, `latest.json` carries it as `release`, and a different release of
+   the same upstream version counts as an update. `herdr --version` prints the release.
+2. **State times and pane moves (server).** Agents carry a `state_since_ms` token with
+   when their current state began, kept across a live handoff, and clients may call
+   `pane.move`. This changes the server, so a running server needs a restart or
+   `herdr server live-handoff --import-exe <new herdr>` (keeps agents running) to pick
+   it up. Older servers just show no ages and refuse cross-space drags.
+3. **Agents under their space.** Most of the code is in a new file
+   (`src/client/shell/space_agents.rs`) so upstream changes rarely conflict with it.
+   - Each space in the sidebar lists its tabs underneath, and clicking one jumps to it.
+     Working and blocked agents show how long they've been at it (`12m`, `3h`, `2d`).
+   - Agent lines show `· N shells` when the agent is running shell commands. The count
+     comes from the watcher in [`extras/shell-count`](extras/shell-count), which runs as
+     a user service on the machine where herdr's server runs.
    - Plain terminals are listed dimmed (`$ backend`). Right-click a space and choose
      Hide terminals to hide them there.
    - A pane working outside its space's home folder (the first tab's) gets a
      `↳ subdir` line.
-   - Working and blocked agents show how long they've been running or waiting
-     (`12m`, `3h`, `2d`).
-   - Drag a line onto another space to move it there as a new tab, or onto a line
-     in the same space to reorder tabs. Right-click a line to rename its tab, move
-     it to another or a new space, or close it. Clicking still jumps to it.
-   - `keys.focus_agent` follows the tree order, which shows the numbers 1-9 beside
-     agents while it's bound.
-7. **Waiting agents by urgency.** The section under the spaces lists agents needing
-   input (a permission, question or plan approval) first, then agents whose finished
-   turn you haven't looked at yet under a "finished" heading. Visiting an agent clears
-   it. `keys.next_agent` / `previous_agent` cycle the most urgent non-empty group (all
-   agents when nobody is waiting).
-8. **Ages only while active.** Only working and blocked agents show a time.
-9. **Unread survives reattach.** Upstream clients treat every turn that finished
-   before they attached as read; this keeps what the server still reports unread, so
-   reattaching doesn't empty the finished list. Upstream's
-   `first_snapshot_establishes_an_idle_baseline_without_server_seen_authority` test
-   asserts the old behavior and fails by design.
-10. **Agent times survive server swaps (server).** A live handoff carries each agent's
-    state and start time, so ages don't reset when the server binary is replaced.
-11. **`herdr update` finds our rebuilds.** CI compiles the release tag in, `latest.json`
-    carries it as `release`, and a different release of the same upstream version
-    counts as an update. `herdr --version` prints the release.
-12. **Multi-machine sidebar.** With machines added, the space tree on the machine
-    being shown supports dragging and the right-click menu. Clicking another machine's
-    agent switches to it on release. The agent keys walk the tree across all machines,
-    most urgent group first, and show the numbers there too. Upstream's
-    `local_agent_click_can_cancel_a_pending_remote_switch` and
-    `switching_machines_preserves_aggregate_agent_scroll_and_visible_rows` expect the
-    switch on mouse-down and fail by design.
-13. **A box per space.** Each space and its tree sit in a box; neighbouring spaces
-    share a border row, and in the multi-machine sidebar each machine's spaces are
-    boxed under its name. Sidebars narrower than 12 columns go without. Upstream's
-    `mouse_hits_use_stable_workspace_tab_and_pane_ids` clicks the row that is now the
-    top border and fails by design.
-14. **Shaded tabs, numbered waiting agents.** Every other tab in a space, and every
-    other agent in the needs-input and finished groups, is shaded a few percent
-    lighter than the terminal's background (terminals that don't report their
-    background get no shading). Plain terminals show `$` in the agent-number column so
-    their names line up with the agents' (collapsed summaries count them as `$2`).
-    Waiting agents show their tree number in the same column.
-15. **Space drop marker.** Dragging a space below the last one marks the bottom edge of
-    the last box instead of that space's first tab line.
-16. **Hover.** The sidebar line under the mouse (a machine, space, tab, collapsed
-    summary or waiting agent) lights up a step brighter than the tab shading. The
-    current tab and space keep their own highlight. Like the shading, it needs a
-    terminal that reports its background.
+   - The ▾ at the right of a space collapses it to one summary row of status counts
+     (`●2 ✓1 $2`); clicking the summary expands it again.
+   - Drag a line onto another space to move it there as a new tab, or onto a line in
+     the same space to reorder tabs. Right-click a line to rename its tab, move it to
+     another or a new space, or close it.
+   - The section under the spaces lists agents needing input (a permission, question or
+     plan approval) first, then agents whose finished turn you haven't looked at yet
+     under a "finished" heading. Visiting an agent clears it. The section sits right
+     under the spaces list, dropping to the bottom only when the list is too long to
+     leave room. Reattaching keeps the turns the server still reports unread.
+   - `keys.next_agent` / `previous_agent` cycle the most urgent non-empty group (all
+     agents when nobody is waiting). `keys.focus_agent` follows the tree order and shows
+     the numbers 1-9 beside agents while it's bound.
+   - With machines added, the tree of the machine being shown supports dragging and the
+     right-click menu, clicking another machine's agent switches to it on release, and
+     the agent keys and numbers walk the tree across all machines.
+   - Upstream tests of the behavior this replaces fail by design, and CI does not run
+     them: the sidebar tests for the old agent list, sort toggle and fixed divider,
+     `first_snapshot_establishes_an_idle_baseline_without_server_seen_authority`,
+     `local_agent_click_can_cancel_a_pending_remote_switch` and
+     `switching_machines_preserves_aggregate_agent_scroll_and_visible_rows`.
+4. **Boxes, shading and hover.**
+   - Each space and its tree sit in a box; neighbouring spaces share a border row, and
+     in the multi-machine sidebar each machine's spaces are boxed under its name.
+     Sidebars narrower than 12 columns go without.
+   - Every other tab in a space, and every other agent in the needs-input and finished
+     groups, is shaded a few percent lighter than the terminal's background. The line
+     under the mouse (a machine, space, tab, collapsed summary or waiting agent) lights
+     up a step brighter; the current tab and space keep their own highlight. Both need a
+     terminal that reports its background.
+   - Plain terminals show `$` in the agent-number column so their names line up with the
+     agents', and waiting agents show their tree number in the same column.
+   - Dragging a space below the last one marks the bottom edge of the last box.
+   - Upstream's `mouse_hits_use_stable_workspace_tab_and_pane_ids` clicks the row that is
+     now a box border and fails by design.
 
 Builds: Linux x86_64, Linux ARM (aarch64) and Apple Silicon macOS. There are no
 Windows or Intel Mac builds; use upstream herdr there.
@@ -162,7 +142,7 @@ Options go after `sh -s --` when piping, e.g. `... | sh -s -- --with-shell-count
 ### Updating
 
 Run `herdr update` outside herdr, or rerun the install command, which also updates
-the extras. Builds before `tree.<patch 11>` can't see patch-only rebuilds, so update
+the extras. Builds before `v0.9.5-tree.1811b71c` can't see patch-only rebuilds, so update
 those once with the install command. When a release changes the server (the README
 marks those patches), swap it with the live-handoff command above.
 

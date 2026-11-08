@@ -1,9 +1,33 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Richard Swanson <rswanson05@gmail.com>
-Date: Sun, 8 Nov 2026 07:00:50 -0600
-Subject: [PATCH] feat: organize the space tree
+Date: Sat, 7 Nov 2026 21:37:27 -0600
+Subject: [PATCH] feat: list agents under their space in the sidebar
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
-Spaces collapse to a status summary, list plain terminals dimmed (hideable per space), show where a pane works when it differs from its space and how long each agent has been in its state. Lines drag onto another space to move the pane or within a space to reorder tabs, and their right-click menu renames, moves or closes. next_agent/previous_agent cycle the agents needing input first, and focus_agent numbers agents in tree order.
+Each space in the expanded sidebar (local and multi-machine) lists its
+tabs underneath: agents with their state, how long they have been
+working or waiting and "· N shells" from the pane's shells token (set
+by the shell-count watcher in the patch repo's extras); plain terminals
+dimmed and hideable per space; and where a pane works when that differs
+from its space. A space collapses to a status summary. Clicking a line
+focuses it on release, switching machines if needed; dragging moves the
+pane to another space or reorders tabs; its right-click menu renames,
+moves or closes.
+
+The section under the spaces lists only agents waiting on the user:
+needing input first, then unread finished turns. It sits right under
+the spaces list while there is room. A newly attached client keeps the
+turns the server reports unread. next_agent/previous_agent cycle the
+most urgent group, and focus_agent numbers agents in tree order, across
+machines.
+
+Upstream tests for the replaced agent list, sort toggle and fixed
+divider, first_snapshot_establishes_an_idle_baseline_without_server_seen_authority,
+local_agent_click_can_cancel_a_pending_remote_switch and
+switching_machines_preserves_aggregate_agent_scroll_and_visible_rows
+assert the old behavior and fail by design.
 
 diff --git a/src/client/mod.rs b/src/client/mod.rs
 index f55db195..5b16915a 100644
@@ -19,6 +43,18 @@ index f55db195..5b16915a 100644
                          let frame = outcome
                              .repaint
                              .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
+diff --git a/src/client/shell.rs b/src/client/shell.rs
+index 2d180443..cfa8869c 100644
+--- a/src/client/shell.rs
++++ b/src/client/shell.rs
+@@ -31,6 +31,7 @@ mod preferences;
+ mod render;
+ mod scroll;
+ mod settings;
++mod space_agents;
+ mod state;
+ mod surface_patch;
+ mod text_editor;
 diff --git a/src/client/shell/actions.rs b/src/client/shell/actions.rs
 index 83819b0d..d0dd8ecb 100644
 --- a/src/client/shell/actions.rs
@@ -47,6 +83,87 @@ index 83819b0d..d0dd8ecb 100644
                  if agents.is_empty() {
                      return None;
                  }
+diff --git a/src/client/shell/agent_sidebar.rs b/src/client/shell/agent_sidebar.rs
+index e43ab8cc..d1fef727 100644
+--- a/src/client/shell/agent_sidebar.rs
++++ b/src/client/shell/agent_sidebar.rs
+@@ -57,21 +57,26 @@ pub(super) fn render_agent_panel(
+     agent_scroll: &mut usize,
+     hits: &mut ShellHitMap,
+ ) {
++    // Fork: every agent is listed under its space; this section shows who is waiting on
++    // the user, most urgent group first.
++    let (title, entries) =
++        super::space_agents::attention_entries(agent_rows(snapshot, config, None), |row| {
++            row.status
++        });
+     if !render_agent_panel_header(
+         buffer,
+         area,
++        title,
+         snapshot.agent_view_label.as_deref(),
+         config,
+         hits,
+     ) {
+         return;
+     }
+-
+-    let rows = agent_rows(snapshot, config, None);
+     render_agent_list(
+         buffer,
+         area,
+-        &rows,
++        &entries,
+         snapshot
+             .agent_view_label
+             .as_ref()
+@@ -79,10 +84,15 @@ pub(super) fn render_agent_panel(
+         config,
+         agent_scroll,
+         hits,
+-        |row| row.rows.len(),
+-        |buffer, rect, row, hits| {
+-            hits.agents.push((rect, row.pane_id.clone()));
+-            render_agent_row(buffer, rect, row, config);
++        |entry| entry.lines(|row| row.rows.len()),
++        |buffer, rect, entry, hits| match entry {
++            super::space_agents::AttentionEntry::Heading(attention) => {
++                super::space_agents::render_attention_heading(buffer, rect, *attention, config)
++            }
++            super::space_agents::AttentionEntry::Agent(row) => {
++                hits.agents.push((rect, row.pane_id.clone()));
++                render_agent_row(buffer, rect, row, config);
++            }
+         },
+     );
+ }
+@@ -90,6 +100,7 @@ pub(super) fn render_agent_panel(
+ pub(super) fn render_agent_panel_header(
+     buffer: &mut Buffer,
+     area: Rect,
++    title: &str,
+     agent_view_label: Option<&str>,
+     config: &ClientShellConfig,
+     hits: &mut ShellHitMap,
+@@ -113,15 +124,13 @@ pub(super) fn render_agent_panel_header(
+         area.x,
+         area.y + 1,
+         area.width,
+-        " agents",
++        title,
+         Style::default()
+             .fg(config.palette.overlay0)
+             .add_modifier(Modifier::BOLD),
+     );
+-    let sort_label = agent_view_label.unwrap_or(match config.agent_panel_sort {
+-        crate::config::AgentPanelSortConfig::Spaces => "grouped",
+-        crate::config::AgentPanelSortConfig::Priority => "priority",
+-    });
++    // Fork: no sort toggle; the section only lists agents needing input.
++    let sort_label = agent_view_label.unwrap_or("");
+     let sort_width = display_width(sort_label).min(area.width as usize) as u16;
+     let sort_rect = Rect::new(
+         area.right().saturating_sub(sort_width),
 diff --git a/src/client/shell/composition.rs b/src/client/shell/composition.rs
 index b7ab4a96..1d644e48 100644
 --- a/src/client/shell/composition.rs
@@ -142,75 +259,299 @@ index a7d6322c..b364b482 100644
              _ => {}
          }
      }
+diff --git a/src/client/shell/endpoint_agent_state.rs b/src/client/shell/endpoint_agent_state.rs
+index 1ebcd35d..e885e07b 100644
+--- a/src/client/shell/endpoint_agent_state.rs
++++ b/src/client/shell/endpoint_agent_state.rs
+@@ -50,10 +50,20 @@ impl EndpointAgentPresentation {
+             self.acknowledged.clear();
+             self.completed.clear();
+             self.working.clear();
++            // Fork: a finished turn the server still reports unread stays unread when a
++            // client attaches, so reattaching doesn't clear the "finished" list.
+             self.acknowledged.extend(
+                 snapshot
+                     .agents
+                     .iter()
++                    .filter(|agent| agent.agent_status != AgentStatus::Done)
++                    .map(|agent| (agent.pane_id.clone(), agent.state_change_seq)),
++            );
++            self.completed.extend(
++                snapshot
++                    .agents
++                    .iter()
++                    .filter(|agent| agent.agent_status == AgentStatus::Done)
+                     .map(|agent| (agent.pane_id.clone(), agent.state_change_seq)),
+             );
+         }
+diff --git a/src/client/shell/endpoint_agents.rs b/src/client/shell/endpoint_agents.rs
+index b56b41fa..cbca4378 100644
+--- a/src/client/shell/endpoint_agents.rs
++++ b/src/client/shell/endpoint_agents.rs
+@@ -52,26 +52,39 @@ pub(super) fn render_expanded(
+     agent_scroll: &mut usize,
+     hits: &mut ShellHitMap,
+ ) {
++    // Fork: every agent is listed under its space; this section shows who is waiting on
++    // the user, most urgent group first.
++    let (title, entries) = super::space_agents::attention_entries(
++        agent_rows(endpoints, active_endpoint_id, config),
++        |row| row.agent.status,
++    );
+     if !super::agent_sidebar::render_agent_panel_header(
+         buffer,
+         area,
++        title,
+         agent_view_label,
+         config,
+         hits,
+     ) {
+         return;
+     }
+-    let rows = agent_rows(endpoints, active_endpoint_id, config);
+     super::agent_sidebar::render_agent_list(
+         buffer,
+         area,
+-        &rows,
++        &entries,
+         agent_view_label.map(|_| " no matching agents"),
+         config,
+         agent_scroll,
+         hits,
+-        |row| row.agent.rows.len(),
+-        |buffer, rect, row, hits| {
++        |entry| entry.lines(|row| row.agent.rows.len()),
++        |buffer, rect, entry, hits| {
++            let row = match entry {
++                super::space_agents::AttentionEntry::Heading(attention) => {
++                    super::space_agents::render_attention_heading(buffer, rect, *attention, config);
++                    return;
++                }
++                super::space_agents::AttentionEntry::Agent(row) => row,
++            };
+             super::agent_sidebar::render_agent_row(buffer, rect, &row.agent, config);
+             if row.stale {
+                 buffer.set_style(
+@@ -122,6 +135,20 @@ impl ClientShellState {
+     }
+ }
+ 
++/// Fork: height of the multi-machine "needs input" list.
++pub(super) fn needs_input_height(
++    endpoints: &[ClientShellEndpoint],
++    active_endpoint_id: &ClientEndpointId,
++    config: &ClientShellConfig,
++) -> u16 {
++    super::space_agents::attention_list_height(
++        agent_rows(endpoints, active_endpoint_id, config),
++        |row| row.agent.status,
++        |row| row.agent.rows.len(),
++        config.agents.row_gap,
++    )
++}
++
+ struct EndpointAgentRow {
+     endpoint_id: ClientEndpointId,
+     machine_label: String,
+diff --git a/src/client/shell/endpoint_navigation.rs b/src/client/shell/endpoint_navigation.rs
+index 3d99e5a6..cd3179d8 100644
+--- a/src/client/shell/endpoint_navigation.rs
++++ b/src/client/shell/endpoint_navigation.rs
+@@ -92,11 +92,9 @@ impl ClientShellState {
+         else {
+             return false;
+         };
+-        self.focus_or_activate(
+-            endpoint_id,
+-            ClientEndpointFocusTarget::Pane(pane_id),
+-            outcome,
+-        );
++        // Fork: switch on release, so lines on the machine being shown can be dragged.
++        let _ = outcome;
++        self.press_space_line(endpoint_id, pane_id, point.0, point.1);
+         true
+     }
+ 
+@@ -167,11 +165,14 @@ impl ClientShellState {
+             action,
+             KeybindAction::PreviousAgent | KeybindAction::NextAgent | KeybindAction::FocusAgent(_)
+         ) {
+-            let agents = super::aggregate_navigation::online_agent_targets(
+-                &self.endpoints,
+-                &self.active_endpoint_id,
+-                self.config.agent_panel_sort,
+-            );
++            // Fork: sidebar tree order across machines; next/previous take the most
++            // urgent group first.
++            let agents = match action {
++                KeybindAction::FocusAgent(_) => {
++                    super::space_agents::endpoint_focus_targets(&self.endpoints)
++                }
++                _ => super::space_agents::endpoint_agent_cycle(&self.endpoints),
++            };
+             if agents.is_empty() {
+                 return true;
+             }
 diff --git a/src/client/shell/endpoint_sidebar.rs b/src/client/shell/endpoint_sidebar.rs
-index 1e2305d3..9d712bd2 100644
+index 96982487..41706629 100644
 --- a/src/client/shell/endpoint_sidebar.rs
 +++ b/src/client/shell/endpoint_sidebar.rs
-@@ -304,9 +304,10 @@ pub(super) fn render_expanded(
+@@ -249,21 +249,6 @@ pub(super) fn render_expanded(
+     } else {
+         Rect::new(area.right().saturating_sub(1), area.y, 1, area.height)
+     };
+-    let (workspace_area, detail_area) =
+-        crate::ui::expanded_sidebar_sections(area, state.sidebar_section_split);
+-    hits.sidebar_section_divider =
+-        crate::ui::sidebar_section_divider_rect(area, state.sidebar_section_split);
+-    put_text(
+-        buffer,
+-        workspace_area.x,
+-        workspace_area.y,
+-        workspace_area.width,
+-        " machines",
+-        Style::default()
+-            .fg(palette.overlay0)
+-            .add_modifier(Modifier::BOLD),
+-    );
+-
+     let empty_collapsed_groups = HashSet::new();
+ 
+     enum Row {
+@@ -292,15 +277,6 @@ pub(super) fn render_expanded(
+             );
+         }
+     }
+-    let body = Rect::new(
+-        workspace_area.x,
+-        workspace_area.y.saturating_add(WORKSPACE_HEADER_ROWS),
+-        workspace_area.width,
+-        workspace_area
+-            .height
+-            .saturating_sub(WORKSPACE_HEADER_ROWS + 1),
+-    );
+-    hits.workspace_body = body;
+     let row_heights = rows
+         .iter()
+         .map(|row| match row {
+@@ -315,7 +291,7 @@ pub(super) fn render_expanded(
+                     .and_then(|snapshot| {
+                         let workspace = snapshot.workspaces.get(entry.index)?;
+                         Some(
+-                            super::sidebar::workspace_rows(
++                            (super::sidebar::workspace_rows(
+                                 workspace,
+                                 super::sidebar::displayed_workspace_status(
+                                     snapshot,
+@@ -327,7 +303,12 @@ pub(super) fn render_expanded(
+                             )
                              .len()
                              .max(1)
-                             .min(u16::MAX as usize) as u16)
--                                .saturating_add(super::space_agents::space_agent_count(
+-                            .min(u16::MAX as usize) as u16,
++                            .min(u16::MAX as usize) as u16)
 +                                .saturating_add(super::space_agents::space_tree_height(
-                                     snapshot,
-                                     &workspace.workspace_id,
++                                    snapshot,
++                                    &workspace.workspace_id,
 +                                    collapsed_groups,
-                                 )),
++                                )),
                          )
                      })
-@@ -465,11 +466,13 @@ pub(super) fn render_expanded(
+                     .unwrap_or(1)
+@@ -348,6 +329,39 @@ pub(super) fn render_expanded(
+             _ => 0,
+         })
+         .collect::<Vec<_>>();
++    // Fork: the agent section only shows agents needing input. It sits right under the
++    // machines list when that fits, otherwise at the bottom.
++    let (workspace_area, detail_area, section_divider) = super::space_agents::sidebar_sections(
++        area,
++        state.sidebar_section_split,
++        super::endpoint_agents::needs_input_height(
++            state.endpoints,
++            state.active_endpoint_id,
++            config,
++        ),
++        super::space_agents::list_content_height(&row_heights, &gaps),
++    );
++    hits.sidebar_section_divider = section_divider;
++    put_text(
++        buffer,
++        workspace_area.x,
++        workspace_area.y,
++        workspace_area.width,
++        " machines",
++        Style::default()
++            .fg(palette.overlay0)
++            .add_modifier(Modifier::BOLD),
++    );
++    let body = Rect::new(
++        workspace_area.x,
++        workspace_area.y.saturating_add(WORKSPACE_HEADER_ROWS),
++        workspace_area.width,
++        workspace_area
++            .height
++            .saturating_sub(WORKSPACE_HEADER_ROWS + 1),
++    );
++    hits.workspace_body = body;
++    let agent_numbers = super::space_agents::endpoint_agent_numbers(state.endpoints, config);
+     let reveal_navigation = !body.is_empty() && std::mem::take(state.reveal_navigation_workspace);
+     let reveal_focus = !body.is_empty() && std::mem::take(state.reveal_focused_workspace);
+     if reveal_navigation || reveal_focus {
+@@ -453,10 +467,17 @@ pub(super) fn render_expanded(
                      entry.indented,
                      &config.spaces,
                  );
--                let agents = super::space_agents::space_agents(snapshot, &workspace.workspace_id);
+-                let height = (tokens.len().max(1).min(u16::MAX as usize) as u16).min(body.height);
+-                if y.saturating_add(height) > body.bottom() {
 +                let tree = super::space_agents::space_tree(
 +                    snapshot,
 +                    &workspace.workspace_id,
 +                    collapsed_groups,
 +                );
-                 let space_height = tokens.len().max(1).min(u16::MAX as usize) as u16;
--                let entry_height = space_height
--                    .saturating_add(agents.len().min(u16::MAX as usize) as u16)
--                    .min(body.height);
++                let space_height = tokens.len().max(1).min(u16::MAX as usize) as u16;
 +                let entry_height = space_height.saturating_add(tree.height()).min(body.height);
-                 if y.saturating_add(entry_height) > body.bottom() {
++                if y.saturating_add(entry_height) > body.bottom() {
                      break;
                  }
-@@ -498,25 +501,22 @@ pub(super) fn render_expanded(
++                let height = space_height.min(entry_height);
+                 let rect = Rect::new(body.x, y, content_width, height);
+                 let nested = Rect::new(
+                     rect.x.saturating_add(2),
+@@ -481,9 +502,32 @@ pub(super) fn render_expanded(
                      false,
                      palette,
                  );
--                let agent_area = Rect::new(
--                    nested.x,
--                    rect.bottom(),
--                    nested.width,
--                    entry_height - height,
--                );
--                super::space_agents::render_space_agents(
 +                let agent_area =
 +                    Rect::new(nested.x, rect.bottom(), nested.width, entry_height - height);
 +                let summary = super::space_agents::render_space_tree(
-                     buffer,
-                     agent_area,
-                     if entry.indented { 8 } else { 3 },
--                    snapshot,
--                    &agents,
++                    buffer,
++                    agent_area,
++                    if entry.indented { 8 } else { 3 },
 +                    &tree,
-+                    &[],
-                     endpoint_active,
-                     config,
--                    |line, agent| {
++                    &|pane_id| {
++                        agent_numbers
++                            .iter()
++                            .position(|(id, pane)| *id == endpoint.endpoint_id && pane == pane_id)
++                    },
++                    endpoint_active,
++                    config,
 +                    super::space_agents::now_unix_ms(),
 +                    |line, item| {
-                         hits.endpoint_agents.push((
-                             line,
-                             endpoint.endpoint_id.clone(),
--                            agent.pane_id.clone(),
++                        hits.endpoint_agents.push((
++                            line,
++                            endpoint.endpoint_id.clone(),
 +                            item.pane_id.to_owned(),
-                         ))
-                     },
-                 );
-@@ -536,6 +536,22 @@ pub(super) fn render_expanded(
++                        ))
++                    },
++                );
+                 if endpoint.status != ClientEndpointStatus::Online {
+                     buffer.set_style(
+-                        rect,
++                        rect.union(agent_area),
+                         Style::default()
+                             .fg(palette.overlay0)
+                             .add_modifier(Modifier::DIM),
+@@ -497,6 +541,22 @@ pub(super) fn render_expanded(
                      collapsed_groups,
                      palette,
                  );
@@ -233,8 +574,17 @@ index 1e2305d3..9d712bd2 100644
                  hits.workspaces.push(WorkspaceHit {
                      rect,
                      endpoint_id: endpoint.endpoint_id.clone(),
+@@ -505,7 +565,7 @@ pub(super) fn render_expanded(
+                     group_toggle,
+                 });
+                 y = y
+-                    .saturating_add(height)
++                    .saturating_add(entry_height)
+                     .saturating_add(gaps.get(row_index).copied().unwrap_or(0));
+             }
+         }
 diff --git a/src/client/shell/mouse.rs b/src/client/shell/mouse.rs
-index 8e873d68..6c61b661 100644
+index 8e873d68..05d1f8ab 100644
 --- a/src/client/shell/mouse.rs
 +++ b/src/client/shell/mouse.rs
 @@ -1020,6 +1020,9 @@ impl ClientShellState {
@@ -280,7 +630,7 @@ index 8e873d68..6c61b661 100644
                  if let Some((endpoint_id, key)) = group_toggle {
                      self.toggle_collapsed_group(&endpoint_id, key);
                      outcome.repaint = true;
-@@ -2151,12 +2165,8 @@ impl ClientShellState {
+@@ -2151,11 +2165,12 @@ impl ClientShellState {
                      .find(|(rect, _)| super::contains(*rect, point))
                      .map(|(_, pane_id)| pane_id.clone());
                  if let Some(pane_id) = agent_pane_id {
@@ -289,12 +639,15 @@ index 8e873d68..6c61b661 100644
 -                            pane_id,
 -                        }),
 -                        outcome,
--                    );
 +                    // Fork: focus on release, so the line can be dragged to another space.
-+                    self.press_space_line(pane_id, mouse.column, mouse.row);
++                    self.press_space_line(
++                        self.active_endpoint_id.clone(),
++                        pane_id,
++                        mouse.column,
++                        mouse.row,
+                     );
                      return;
                  }
-                 let scrollbar_hit = self
 diff --git a/src/client/shell/overlays.rs b/src/client/shell/overlays.rs
 index f26cc6e4..cb4bdffa 100644
 --- a/src/client/shell/overlays.rs
@@ -318,22 +671,100 @@ index f26cc6e4..cb4bdffa 100644
      }
      Some(OverlayRender {
 diff --git a/src/client/shell/sidebar.rs b/src/client/shell/sidebar.rs
-index 3f00891a..da7105a5 100644
+index 46c3a1a0..21eea77d 100644
 --- a/src/client/shell/sidebar.rs
 +++ b/src/client/shell/sidebar.rs
-@@ -228,9 +228,10 @@ pub(crate) fn render_sidebar(
+@@ -211,31 +211,7 @@ pub(crate) fn render_sidebar(
+     } else {
+         Rect::new(area.right().saturating_sub(1), area.y, 1, area.height)
+     };
+-    let (workspace_area, detail_area) =
+-        crate::ui::expanded_sidebar_sections(area, state.sidebar_section_split);
+-    hits.sidebar_section_divider =
+-        crate::ui::sidebar_section_divider_rect(area, state.sidebar_section_split);
+-    put_text(
+-        buffer,
+-        workspace_area.x,
+-        workspace_area.y,
+-        workspace_area.width,
+-        " spaces",
+-        Style::default()
+-            .fg(palette.overlay0)
+-            .add_modifier(Modifier::BOLD),
+-    );
+-
+     let entries = workspace_entries(snapshot, state.collapsed_groups);
+-    let body = Rect::new(
+-        workspace_area.x,
+-        workspace_area.y.saturating_add(WORKSPACE_HEADER_ROWS),
+-        workspace_area.width,
+-        workspace_area
+-            .height
+-            .saturating_sub(WORKSPACE_HEADER_ROWS + 1),
+-    );
+-    hits.workspace_body = body;
+     let row_heights = entries
+         .iter()
+         .map(|entry| {
+@@ -243,7 +219,7 @@ pub(crate) fn render_sidebar(
+                 .workspaces
+                 .get(entry.index)
+                 .map(|workspace| {
+-                    workspace_rows(
++                    (workspace_rows(
+                         workspace,
+                         displayed_workspace_status(snapshot, workspace, state.collapsed_groups),
+                         entry.indented,
+@@ -251,7 +227,12 @@ pub(crate) fn render_sidebar(
+                     )
                      .len()
                      .max(1)
-                     .min(u16::MAX as usize) as u16)
--                        .saturating_add(space_agents::space_agent_count(
+-                    .min(u16::MAX as usize) as u16
++                    .min(u16::MAX as usize) as u16)
 +                        .saturating_add(space_agents::space_tree_height(
-                             snapshot,
-                             &workspace.workspace_id,
++                            snapshot,
++                            &workspace.workspace_id,
 +                            state.collapsed_groups,
-                         ))
++                        ))
                  })
                  .unwrap_or(1)
-@@ -306,6 +307,8 @@ pub(crate) fn render_sidebar(
+         })
+@@ -265,6 +246,34 @@ pub(crate) fn render_sidebar(
+                 .map_or(0, |next| u16::from(!next.indented) * config.spaces.row_gap)
+         })
+         .collect::<Vec<_>>();
++    // Fork: the agent section only shows agents needing input. It sits right under the
++    // spaces list when that fits, otherwise at the bottom.
++    let (workspace_area, detail_area, section_divider) = space_agents::sidebar_sections(
++        area,
++        state.sidebar_section_split,
++        space_agents::local_needs_input_height(snapshot, config),
++        space_agents::list_content_height(&row_heights, &gaps),
++    );
++    hits.sidebar_section_divider = section_divider;
++    put_text(
++        buffer,
++        workspace_area.x,
++        workspace_area.y,
++        workspace_area.width,
++        " spaces",
++        Style::default()
++            .fg(palette.overlay0)
++            .add_modifier(Modifier::BOLD),
++    );
++    let body = Rect::new(
++        workspace_area.x,
++        workspace_area.y.saturating_add(WORKSPACE_HEADER_ROWS),
++        workspace_area.width,
++        workspace_area
++            .height
++            .saturating_sub(WORKSPACE_HEADER_ROWS + 1),
++    );
++    hits.workspace_body = body;
+     let mut metrics = super::scroll::list_scroll_metrics(
+         &row_heights,
+         &gaps,
+@@ -298,6 +307,8 @@ pub(crate) fn render_sidebar(
          .saturating_sub(metrics.offset_from_bottom);
      let show_scrollbar = metrics.max_offset_from_bottom > 0 && body.width > 1;
      let content_width = body.width.saturating_sub(u16::from(show_scrollbar));
@@ -342,22 +773,24 @@ index 3f00891a..da7105a5 100644
      let mut y = body.y;
      for (entry_position, entry) in entries.iter().enumerate().skip(*state.workspace_scroll) {
          let Some(workspace) = snapshot.workspaces.get(entry.index) else {
-@@ -313,11 +316,10 @@ pub(crate) fn render_sidebar(
+@@ -305,10 +316,14 @@ pub(crate) fn render_sidebar(
          };
          let status = displayed_workspace_status(snapshot, workspace, state.collapsed_groups);
          let rows = workspace_rows(workspace, status, entry.indented, &config.spaces);
--        let agents = space_agents::space_agents(snapshot, &workspace.workspace_id);
+-        let row_height = (rows.len().max(1).min(u16::MAX as usize) as u16).min(body.height);
+-        if y.saturating_add(row_height) > body.bottom() {
 +        let tree =
 +            space_agents::space_tree(snapshot, &workspace.workspace_id, state.collapsed_groups);
-         let space_height = rows.len().max(1).min(u16::MAX as usize) as u16;
--        let entry_height = space_height
--            .saturating_add(agents.len().min(u16::MAX as usize) as u16)
--            .min(body.height);
++        let space_height = rows.len().max(1).min(u16::MAX as usize) as u16;
 +        let entry_height = space_height.saturating_add(tree.height()).min(body.height);
-         if y.saturating_add(entry_height) > body.bottom() {
++        if y.saturating_add(entry_height) > body.bottom() {
              break;
          }
-@@ -355,6 +357,12 @@ pub(crate) fn render_sidebar(
++        let row_height = space_height.min(entry_height);
+         let rect = Rect::new(body.x, y, content_width, row_height);
+         let selected = state.selected_workspace_id.is_some_and(|target| {
+             target.matches(state.active_endpoint_id, &workspace.workspace_id)
+@@ -342,6 +357,12 @@ pub(crate) fn render_sidebar(
              state.collapsed_groups,
              palette,
          );
@@ -370,27 +803,23 @@ index 3f00891a..da7105a5 100644
          hits.workspaces.push(WorkspaceHit {
              rect,
              endpoint_id: ClientEndpointId::Local,
-@@ -362,7 +370,7 @@ pub(crate) fn render_sidebar(
+@@ -349,10 +370,32 @@ pub(crate) fn render_sidebar(
              indented: entry.indented,
              group_toggle,
          });
--        space_agents::render_space_agents(
 +        if let Some(summary) = space_agents::render_space_tree(
-             buffer,
-             Rect::new(
-                 body.x,
-@@ -371,12 +379,19 @@ pub(crate) fn render_sidebar(
-                 entry_height - row_height,
-             ),
-             if entry.indented { 8 } else { 3 },
--            snapshot,
--            &agents,
++            buffer,
++            Rect::new(
++                body.x,
++                rect.bottom(),
++                content_width,
++                entry_height - row_height,
++            ),
++            if entry.indented { 8 } else { 3 },
 +            &tree,
-+            &agent_numbers,
-             true,
-             config,
--            |line, agent| hits.agents.push((line, agent.pane_id.clone())),
--        );
++            &|pane_id| agent_numbers.iter().position(|id| id == pane_id),
++            true,
++            config,
 +            now_ms,
 +            |line, item| hits.agents.push((line, item.pane_id.to_owned())),
 +        ) {
@@ -403,46 +832,150 @@ index 3f00891a..da7105a5 100644
          let gap = entries
              .get(entry_position + 1)
              .map_or(0, |next| u16::from(!next.indented) * config.spaces.row_gap);
+-        y = y.saturating_add(row_height + gap);
++        y = y.saturating_add(entry_height + gap);
+     }
+ 
+     if show_scrollbar {
 diff --git a/src/client/shell/space_agents.rs b/src/client/shell/space_agents.rs
-index abf97d94..26158b2d 100644
---- a/src/client/shell/space_agents.rs
+new file mode 100644
+index 00000000..b92c2c0d
+--- /dev/null
 +++ b/src/client/shell/space_agents.rs
-@@ -1,47 +1,226 @@
--//! Fork addition: each space lists its agents under it in the expanded sidebar,
--//! and the bottom agent section only shows agents that need input.
+@@ -0,0 +1,1663 @@
 +//! Fork addition: the expanded sidebar lists each space's agents and terminals under it
 +//! as a tree, and the agent section only shows agents that need input.
- //!
- //! Lives in its own file so upstream sidebar changes rarely conflict with it.
- 
++//!
++//! Lives in its own file so upstream sidebar changes rarely conflict with it.
++
 +use std::collections::HashSet;
 +
- use ratatui::{
-     text::{Line, Span},
-     widgets::{Paragraph, Widget},
- };
- 
++use ratatui::{
++    text::{Line, Span},
++    widgets::{Paragraph, Widget},
++};
++
 +use super::render::put_text;
- use super::*;
- use crate::api::schema::AgentStatus;
--use crate::protocol::ClientShellAgent;
++use super::*;
++use crate::api::schema::AgentStatus;
 +use crate::protocol::{ClientShellAgent, ClientShellPane, ClientShellTab};
 +use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
- 
- /// Rows the agent section draws above its list: divider, title, blank line.
- const NEEDS_INPUT_HEADER_ROWS: u16 = 3;
- 
++
++/// Rows the agent section draws above its list: divider, title, blank line.
++const NEEDS_INPUT_HEADER_ROWS: u16 = 3;
++
 +/// Keys stored with the client's collapsed worktree groups, so they persist the same way.
 +const COLLAPSED_KEY_PREFIX: &str = "fork.space-collapsed:";
 +const TERMINALS_HIDDEN_KEY_PREFIX: &str = "fork.space-terminals-hidden:";
 +
- /// Whether an agent belongs in the bottom "needs input" section.
- pub(in crate::client::shell) fn needs_input(status: AgentStatus) -> bool {
-     status == AgentStatus::Blocked
- }
- 
--/// The agents in one space, in the agent panel's grouped order.
--pub(in crate::client::shell) fn space_agents<'a>(
++/// How urgently an agent wants the user, most urgent first.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
++pub(in crate::client::shell) enum Attention {
++    /// Blocked on a prompt: a permission, a question or a plan approval.
++    NeedsInput,
++    /// Finished a turn the user hasn't looked at yet.
++    Finished,
++}
++
++impl Attention {
++    pub(in crate::client::shell) fn of(status: AgentStatus) -> Option<Self> {
++        match status {
++            AgentStatus::Blocked => Some(Self::NeedsInput),
++            AgentStatus::Done => Some(Self::Finished),
++            AgentStatus::Working | AgentStatus::Idle | AgentStatus::Unknown => None,
++        }
++    }
++
++    fn title(self) -> &'static str {
++        match self {
++            Self::NeedsInput => " needs input",
++            Self::Finished => " finished",
++        }
++    }
++}
++
++/// One entry of the attention section: a group heading or an agent row.
++pub(in crate::client::shell) enum AttentionEntry<T> {
++    /// A blank line, then the group's name.
++    Heading(Attention),
++    Agent(T),
++}
++
++impl<T> AttentionEntry<T> {
++    pub(in crate::client::shell) fn lines(&self, agent_lines: impl Fn(&T) -> usize) -> usize {
++        match self {
++            Self::Heading(_) => 2,
++            Self::Agent(row) => agent_lines(row),
++        }
++    }
++}
++
++/// Group the agents waiting on the user, most urgent group first, keeping their order
++/// within a group. The first group names the section; later groups get a heading.
++pub(in crate::client::shell) fn attention_entries<T>(
++    rows: Vec<T>,
++    status: impl Fn(&T) -> AgentStatus,
++) -> (&'static str, Vec<AttentionEntry<T>>) {
++    let mut grouped = rows
++        .into_iter()
++        .filter_map(|row| Attention::of(status(&row)).map(|attention| (attention, row)))
++        .collect::<Vec<_>>();
++    grouped.sort_by_key(|(attention, _)| *attention);
++    let title = grouped
++        .first()
++        .map_or(Attention::NeedsInput.title(), |(attention, _)| {
++            attention.title()
++        });
++    let mut entries = Vec::with_capacity(grouped.len() + 1);
++    let mut previous = None;
++    for (attention, row) in grouped {
++        if previous.is_some_and(|previous| previous != attention) {
++            entries.push(AttentionEntry::Heading(attention));
++        }
++        previous = Some(attention);
++        entries.push(AttentionEntry::Agent(row));
++    }
++    (title, entries)
++}
++
++/// Draw a group heading on the second line of its two-line entry.
++pub(in crate::client::shell) fn render_attention_heading(
++    buffer: &mut Buffer,
++    rect: Rect,
++    attention: Attention,
++    config: &ClientShellConfig,
++) {
++    if rect.height < 2 {
++        return;
++    }
++    put_text(
++        buffer,
++        rect.x,
++        rect.y + 1,
++        rect.width,
++        attention.title(),
++        Style::default()
++            .fg(config.palette.overlay0)
++            .add_modifier(Modifier::BOLD),
++    );
++}
++
++/// Height of the attention section's list for these rows.
++pub(in crate::client::shell) fn attention_list_height<T>(
++    rows: Vec<T>,
++    status: impl Fn(&T) -> AgentStatus,
++    agent_lines: impl Fn(&T) -> usize,
++    row_gap: u16,
++) -> u16 {
++    let (_, entries) = attention_entries(rows, status);
++    list_height(
++        entries
++            .iter()
++            .map(|entry| entry.lines(&agent_lines).min(u16::MAX as usize) as u16),
++        row_gap,
++    )
++}
++
 +/// Key that marks a space's tree as collapsed.
 +pub(in crate::client::shell) fn collapsed_key(workspace_id: &str) -> String {
 +    format!("{COLLAPSED_KEY_PREFIX}{workspace_id}")
@@ -507,10 +1040,7 @@ index abf97d94..26158b2d 100644
 +/// Build the tree for one space: each tab's panes, agents first-class and plain
 +/// terminals dimmed (unless hidden for this space).
 +pub(in crate::client::shell) fn space_tree<'a>(
-     snapshot: &'a ClientShellSnapshot,
--    workspace_id: &str,
--) -> Vec<&'a ClientShellAgent> {
--    snapshot
++    snapshot: &'a ClientShellSnapshot,
 +    workspace_id: &'a str,
 +    collapsed_groups: &HashSet<String>,
 +) -> SpaceTree<'a> {
@@ -571,10 +1101,8 @@ index abf97d94..26158b2d 100644
 +    }
 +    // Never hide an agent the pane list doesn't cover.
 +    let unlisted = snapshot
-         .agents
-         .iter()
--        .filter(|agent| agent.workspace_id == workspace_id)
--        .collect()
++        .agents
++        .iter()
 +        .filter(|agent| {
 +            agent.workspace_id == workspace_id
 +                && !items.iter().any(|item| item.pane_id == agent.pane_id)
@@ -594,17 +1122,14 @@ index abf97d94..26158b2d 100644
 +        collapsed: !items.is_empty() && collapsed_groups.contains(&collapsed_key(workspace_id)),
 +        items,
 +    }
- }
- 
--pub(in crate::client::shell) fn space_agent_count(
++}
++
 +/// Rows a space's tree takes under it.
 +pub(in crate::client::shell) fn space_tree_height(
-     snapshot: &ClientShellSnapshot,
-     workspace_id: &str,
++    snapshot: &ClientShellSnapshot,
++    workspace_id: &str,
 +    collapsed_groups: &HashSet<String>,
- ) -> u16 {
--    snapshot
--        .agents
++) -> u16 {
 +    space_tree(snapshot, workspace_id, collapsed_groups).height()
 +}
 +
@@ -612,10 +1137,7 @@ index abf97d94..26158b2d 100644
 +pub(in crate::client::shell) fn tree_agent_pane_ids(snapshot: &ClientShellSnapshot) -> Vec<String> {
 +    let none_collapsed = HashSet::new();
 +    super::sidebar::workspace_entries(snapshot, &none_collapsed)
-         .iter()
--        .filter(|agent| agent.workspace_id == workspace_id)
--        .count()
--        .min(u16::MAX as usize) as u16
++        .iter()
 +        .filter_map(|entry| snapshot.workspaces.get(entry.index))
 +        .flat_map(|workspace| {
 +            space_tree(snapshot, &workspace.workspace_id, &none_collapsed)
@@ -628,32 +1150,125 @@ index abf97d94..26158b2d 100644
 +        .collect()
 +}
 +
-+/// The agents next/previous agent cycles through: those needing input when any do,
-+/// otherwise all of them, in sidebar order.
++/// The agents next/previous agent cycles through, in sidebar order: those needing input
++/// when any do, else unread finished ones, else all of them.
 +pub(in crate::client::shell) fn agent_cycle(snapshot: &ClientShellSnapshot) -> Vec<String> {
 +    let all = tree_agent_pane_ids(snapshot);
-+    let waiting = all
-+        .iter()
-+        .filter(|pane_id| {
-+            snapshot
-+                .agents
-+                .iter()
-+                .any(|agent| agent.pane_id == **pane_id && needs_input(agent.agent_status))
-+        })
-+        .cloned()
-+        .collect::<Vec<_>>();
-+    if waiting.is_empty() {
-+        all
-+    } else {
-+        waiting
++    for attention in [Attention::NeedsInput, Attention::Finished] {
++        let group = all
++            .iter()
++            .filter(|pane_id| {
++                snapshot.agents.iter().any(|agent| {
++                    agent.pane_id == **pane_id
++                        && Attention::of(agent.agent_status) == Some(attention)
++                })
++            })
++            .cloned()
++            .collect::<Vec<_>>();
++        if !group.is_empty() {
++            return group;
++        }
 +    }
- }
- 
- /// A named tab says the most about an agent; otherwise use the agent's own title.
-@@ -61,6 +240,73 @@ fn agent_label<'a>(snapshot: &'a ClientShellSnapshot, agent: &'a ClientShellAgen
-         .unwrap_or(agent.pane_id.as_str())
- }
- 
++    all
++}
++
++/// Online machines' agents in sidebar order: machines top to bottom, then spaces, then
++/// tabs, with each agent's status as this client shows it.
++fn endpoint_tree_agents(
++    endpoints: &[ClientShellEndpoint],
++) -> Vec<(ClientEndpointId, String, AgentStatus)> {
++    endpoints
++        .iter()
++        .filter(|endpoint| endpoint.status == ClientEndpointStatus::Online)
++        .filter_map(|endpoint| Some((endpoint, endpoint.snapshot.as_deref()?)))
++        .flat_map(|(endpoint, snapshot)| {
++            tree_agent_pane_ids(snapshot)
++                .into_iter()
++                .map(|pane_id| {
++                    let status = snapshot
++                        .agents
++                        .iter()
++                        .find(|agent| agent.pane_id == pane_id)
++                        .map_or(AgentStatus::Unknown, |agent| agent.agent_status);
++                    (endpoint.endpoint_id.clone(), pane_id, status)
++                })
++                .collect::<Vec<_>>()
++        })
++        .collect()
++}
++
++fn aggregate_targets(
++    agents: impl IntoIterator<Item = (ClientEndpointId, String, AgentStatus)>,
++) -> Vec<super::aggregate_navigation::AggregateAgentTarget> {
++    agents
++        .into_iter()
++        .map(
++            |(endpoint_id, pane_id, _)| super::aggregate_navigation::AggregateAgentTarget {
++                endpoint_id,
++                pane_id,
++            },
++        )
++        .collect()
++}
++
++/// Multi-machine `focus_agent` targets: every agent in sidebar order.
++pub(in crate::client::shell) fn endpoint_focus_targets(
++    endpoints: &[ClientShellEndpoint],
++) -> Vec<super::aggregate_navigation::AggregateAgentTarget> {
++    aggregate_targets(endpoint_tree_agents(endpoints))
++}
++
++/// Multi-machine next/previous agent: the most urgent non-empty group across all
++/// machines, else every agent, in sidebar order.
++pub(in crate::client::shell) fn endpoint_agent_cycle(
++    endpoints: &[ClientShellEndpoint],
++) -> Vec<super::aggregate_navigation::AggregateAgentTarget> {
++    let all = endpoint_tree_agents(endpoints);
++    for attention in [Attention::NeedsInput, Attention::Finished] {
++        let group = all
++            .iter()
++            .filter(|(_, _, status)| Attention::of(*status) == Some(attention))
++            .cloned()
++            .collect::<Vec<_>>();
++        if !group.is_empty() {
++            return aggregate_targets(group);
++        }
++    }
++    aggregate_targets(all)
++}
++
++/// Multi-machine agent numbers 1-9 as (machine, pane), when `keys.focus_agent` is bound.
++pub(in crate::client::shell) fn endpoint_agent_numbers(
++    endpoints: &[ClientShellEndpoint],
++    config: &ClientShellConfig,
++) -> Vec<(ClientEndpointId, String)> {
++    if config.keybinds.keybinds.focus_agent.is_empty() {
++        return Vec::new();
++    }
++    endpoint_tree_agents(endpoints)
++        .into_iter()
++        .take(9)
++        .map(|(endpoint_id, pane_id, _)| (endpoint_id, pane_id))
++        .collect()
++}
++
++/// A named tab says the most about an agent; otherwise use the agent's own title.
++fn agent_label<'a>(snapshot: &'a ClientShellSnapshot, agent: &'a ClientShellAgent) -> &'a str {
++    snapshot
++        .tabs
++        .iter()
++        .find(|tab| tab.tab_id == agent.tab_id && tab.custom_label)
++        .map(|tab| tab.label.as_str())
++        .or(agent.name.as_deref())
++        .or(agent
++            .terminal_title_stripped
++            .as_deref()
++            .filter(|title| !title.is_empty()))
++        .or(agent.display_agent.as_deref())
++        .or(agent.agent.as_deref())
++        .unwrap_or(agent.pane_id.as_str())
++}
++
 +/// A terminal's pane or tab name, else the folder it's in. The flag says it's the folder.
 +fn terminal_label(tab: &ClientShellTab, pane: &ClientShellPane) -> (String, bool) {
 +    if let Some(label) = pane.label.as_deref().filter(|label| !label.is_empty()) {
@@ -721,16 +1336,22 @@ index abf97d94..26158b2d 100644
 +    std::iter::once('…').chain(kept.into_iter().rev()).collect()
 +}
 +
- /// "2 shells" from the `shells` pane token, which the herdr-shell-count watcher reports
- /// with the number of shell commands the agent process is running.
- fn shell_count_text(agent: &ClientShellAgent) -> Option<String> {
-@@ -76,65 +322,283 @@ fn shell_count_text(agent: &ClientShellAgent) -> Option<String> {
-     ))
- }
- 
--/// Draw one line per agent from the top of `area`, calling `on_line` with each line's
--/// rect so the caller can register it as a click target.
-+/// How long an agent has been in its state, from the server's `state_since_ms` token:
++/// "2 shells" from the `shells` pane token, which the herdr-shell-count watcher reports
++/// with the number of shell commands the agent process is running.
++fn shell_count_text(agent: &ClientShellAgent) -> Option<String> {
++    let count = agent
++        .tokens
++        .iter()
++        .find(|(name, _)| name == "shells")
++        .and_then(|(_, value)| value.trim().parse::<u32>().ok())
++        .filter(|count| *count > 0)?;
++    Some(format!(
++        " · {count} shell{}",
++        if count == 1 { "" } else { "s" }
++    ))
++}
++
++/// How long an active agent has been working or waiting, from the `state_since_ms` token:
 +/// "12m", "3h", "2d". Nothing under a minute.
 +fn state_age_text(agent: &ClientShellAgent, now_ms: u64) -> Option<String> {
 +    let minutes = state_age_minutes(agent, now_ms)?;
@@ -742,8 +1363,13 @@ index abf97d94..26158b2d 100644
 +    }
 +}
 +
++/// Minutes an active agent has been running or waiting on the user. Idle and finished
++/// agents have no age: how long something has sat idle isn't worth the space.
 +fn state_age_minutes(agent: &ClientShellAgent, now_ms: u64) -> Option<u64> {
-+    if agent.agent_status == AgentStatus::Unknown {
++    if !matches!(
++        agent.agent_status,
++        AgentStatus::Working | AgentStatus::Blocked
++    ) {
 +        return None;
 +    }
 +    let since = agent
@@ -802,27 +1428,19 @@ index abf97d94..26158b2d 100644
 +
 +/// Draw a space's tree from the top of `area`. Calls `on_line` with each row that
 +/// points at a pane; returns the summary row of a collapsed tree, which expands it.
- #[allow(clippy::too_many_arguments)] // mirrors the other sidebar row renderers
--pub(in crate::client::shell) fn render_space_agents(
++#[allow(clippy::too_many_arguments)] // mirrors the other sidebar row renderers
 +pub(in crate::client::shell) fn render_space_tree(
-     buffer: &mut Buffer,
-     area: Rect,
-     indent: u16,
--    snapshot: &ClientShellSnapshot,
--    agents: &[&ClientShellAgent],
++    buffer: &mut Buffer,
++    area: Rect,
++    indent: u16,
 +    tree: &SpaceTree<'_>,
-+    agent_numbers: &[String],
-     show_focus: bool,
-     config: &ClientShellConfig,
--    mut on_line: impl FnMut(Rect, &ClientShellAgent),
--) {
++    agent_number: &dyn Fn(&str) -> Option<usize>,
++    show_focus: bool,
++    config: &ClientShellConfig,
 +    now_ms: u64,
 +    mut on_line: impl FnMut(Rect, &SpaceItem<'_>),
 +) -> Option<Rect> {
-     let palette = &config.palette;
--    for (index, agent) in agents.iter().enumerate() {
--        let y = area.y.saturating_add(index.min(u16::MAX as usize) as u16);
--        if y >= area.bottom() {
++    let palette = &config.palette;
 +    if area.is_empty() || tree.items.is_empty() {
 +        return None;
 +    }
@@ -834,28 +1452,16 @@ index abf97d94..26158b2d 100644
 +    let mut y = area.y;
 +    for item in &tree.items {
 +        if y.saturating_add(item.height()) > area.bottom() {
-             break;
-         }
--        let line = Rect::new(area.x, y, area.width, 1);
--        let focused = show_focus && agent.focused;
++            break;
++        }
 +        let rect = Rect::new(area.x, y, area.width, item.height());
 +        let focused = show_focus && item.focused;
-         if focused {
--            buffer.set_style(line, Style::default().bg(palette.active_row_bg));
++        if focused {
 +            buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
-         }
--        let label_style = if focused {
--            Style::default()
--                .fg(palette.text)
--                .add_modifier(Modifier::BOLD)
--        } else {
--            Style::default().fg(palette.subtext0)
++        }
 +        let x = rect.x.saturating_add(indent).min(rect.right());
 +        let width = usize::from(rect.right().saturating_sub(x));
-+        let number = agent_numbers
-+            .iter()
-+            .position(|pane_id| pane_id == item.pane_id)
-+            .filter(|index| *index < 9);
++        let number = agent_number(item.pane_id).filter(|index| *index < 9);
 +        if let Some(index) = number.filter(|_| indent >= 2) {
 +            put_text(
 +                buffer,
@@ -929,26 +1535,7 @@ index abf97d94..26158b2d 100644
 +                    ),
 +                ]
 +            }
-         };
--        let x = line.x.saturating_add(indent).min(line.right());
--        let icon = status_icon(agent.agent_status, config.status_indicators);
--        let shells = shell_count_text(agent).unwrap_or_default();
--        // Shorten the label rather than let the shell count fall off the edge.
--        let label_width = usize::from(line.right().saturating_sub(x))
--            .saturating_sub(UnicodeWidthStr::width(icon) + 1 + UnicodeWidthStr::width(shells.as_str()));
--        let mut spans = vec![
--            Span::styled(
--                icon,
--                Style::default().fg(status_color(agent.agent_status, palette)),
--            ),
--            Span::raw(" "),
--            Span::styled(
--                crate::ui::truncate_end(agent_label(snapshot, agent), label_width),
--                label_style,
--            ),
--        ];
--        if !shells.is_empty() {
--            spans.push(Span::styled(shells, Style::default().fg(palette.overlay0)));
++        };
 +        let age_width = item
 +            .agent()
 +            .and_then(|agent| state_age_text(agent, now_ms))
@@ -968,10 +1555,7 @@ index abf97d94..26158b2d 100644
 +                &format!("↳ {}", truncate_start(place, place_width.saturating_sub(2))),
 +                Style::default().fg(palette.overlay0),
 +            );
-         }
--        Paragraph::new(Line::from(spans))
--            .render(Rect::new(x, y, line.right().saturating_sub(x), 1), buffer);
--        on_line(line, agent);
++        }
 +        on_line(rect, item);
 +        y = rect.bottom();
 +    }
@@ -1035,25 +1619,103 @@ index abf97d94..26158b2d 100644
 +) -> Vec<String> {
 +    if config.keybinds.keybinds.focus_agent.is_empty() {
 +        return Vec::new();
-     }
++    }
 +    let mut ids = tree_agent_pane_ids(snapshot);
 +    ids.truncate(9);
 +    ids
- }
- 
- /// Total height of a list of entries separated by `row_gap`.
--pub(in crate::client::shell) fn list_height(heights: impl Iterator<Item = u16>, row_gap: u16) -> u16 {
++}
++
++/// Total height of a list of entries separated by `row_gap`.
 +pub(in crate::client::shell) fn list_height(
 +    heights: impl Iterator<Item = u16>,
 +    row_gap: u16,
 +) -> u16 {
-     let mut total = 0u16;
-     for (index, height) in heights.enumerate() {
-         if index > 0 {
-@@ -222,6 +686,395 @@ pub(in crate::client::shell) fn sidebar_sections(
-     (spaces, detail, divider)
- }
- 
++    let mut total = 0u16;
++    for (index, height) in heights.enumerate() {
++        if index > 0 {
++            total = total.saturating_add(row_gap);
++        }
++        total = total.saturating_add(height.max(1));
++    }
++    total
++}
++
++/// Height of the local attention list.
++pub(in crate::client::shell) fn local_needs_input_height(
++    snapshot: &ClientShellSnapshot,
++    config: &ClientShellConfig,
++) -> u16 {
++    attention_list_height(
++        super::agent_sidebar::agent_rows(snapshot, config, None),
++        |row| row.status,
++        |row| row.rows.len(),
++        config.agents.row_gap,
++    )
++}
++
++/// Total rows of a sidebar list from its per-entry heights and the gaps after each entry.
++pub(in crate::client::shell) fn list_content_height(heights: &[u16], gaps: &[u16]) -> u16 {
++    heights
++        .iter()
++        .chain(gaps)
++        .fold(0u16, |total, rows| total.saturating_add(*rows))
++}
++
++/// Split the expanded sidebar into (spaces, needs input, divider). The needs-input
++/// section takes room only while an agent needs input. When the spaces list
++/// (`spaces_list_height` rows) leaves enough room, it sits right under the list, above
++/// the spaces footer. Otherwise it takes the bottom, just big enough for its rows and
++/// up to the user's draggable split, and the spaces list scrolls. The sidebar's last
++/// row stays free for the collapse toggle whenever the section isn't at the bottom.
++pub(in crate::client::shell) fn sidebar_sections(
++    area: Rect,
++    split_ratio: f32,
++    needs_input_height: u16,
++    spaces_list_height: u16,
++) -> (Rect, Rect, Rect) {
++    let (upstream_spaces, upstream_detail) =
++        crate::ui::expanded_sidebar_sections(area, split_ratio);
++    let content = upstream_spaces.union(upstream_detail);
++    if content.is_empty() {
++        return (Rect::default(), Rect::default(), Rect::default());
++    }
++    let full_spaces = Rect::new(
++        content.x,
++        content.y,
++        content.width,
++        content.height.saturating_sub(1),
++    );
++    if needs_input_height == 0 {
++        let detail = Rect::new(content.x, full_spaces.bottom(), content.width, 0);
++        return (full_spaces, detail, Rect::default());
++    }
++    let wanted = NEEDS_INPUT_HEADER_ROWS.saturating_add(needs_input_height);
++    // Spaces header, list, this section and the spaces footer row.
++    let inline_rows = WORKSPACE_HEADER_ROWS
++        .saturating_add(spaces_list_height)
++        .saturating_add(wanted)
++        .saturating_add(1);
++    if inline_rows <= full_spaces.height {
++        let detail = Rect::new(
++            content.x,
++            full_spaces.y + WORKSPACE_HEADER_ROWS + spaces_list_height,
++            content.width,
++            wanted,
++        );
++        return (full_spaces, detail, Rect::default());
++    }
++    let detail_height = wanted.min(upstream_detail.height);
++    let spaces_height = content.height.saturating_sub(detail_height);
++    let spaces = Rect::new(content.x, content.y, content.width, spaces_height);
++    let detail = Rect::new(content.x, spaces.bottom(), content.width, detail_height);
++    let divider = if crate::ui::sidebar_section_divider_rect(area, split_ratio).is_empty() {
++        Rect::default()
++    } else {
++        Rect::new(detail.x, detail.y, detail.width, 1)
++    };
++    (spaces, detail, divider)
++}
++
 +/// Context menu for a line in the space tree.
 +pub(in crate::client::shell) fn space_line_menu_items(
 +    destinations: &[(String, String)],
@@ -1089,6 +1751,7 @@ index abf97d94..26158b2d 100644
 +}
 +
 +struct LinePress {
++    endpoint_id: ClientEndpointId,
 +    pane_id: String,
 +    column: u16,
 +    row: u16,
@@ -1122,9 +1785,16 @@ index abf97d94..26158b2d 100644
 +            .map(|(_, endpoint_id, key)| (endpoint_id.clone(), key.clone()))
 +    }
 +
-+    pub(super) fn press_space_line(&mut self, pane_id: String, column: u16, row: u16) {
++    pub(super) fn press_space_line(
++        &mut self,
++        endpoint_id: ClientEndpointId,
++        pane_id: String,
++        column: u16,
++        row: u16,
++    ) {
 +        self.space_tree.drag = None;
 +        self.space_tree.press = Some(LinePress {
++            endpoint_id,
 +            pane_id,
 +            column,
 +            row,
@@ -1162,7 +1832,11 @@ index abf97d94..26158b2d 100644
 +                let Some(press) = self.space_tree.press.as_ref() else {
 +                    return false;
 +                };
-+                if press.column == mouse.column && press.row == mouse.row {
++                // Lines only move within the machine being shown; elsewhere, release still
++                // switches to the agent.
++                if (press.column == mouse.column && press.row == mouse.row)
++                    || press.endpoint_id != self.active_endpoint_id
++                {
 +                    return true;
 +                }
 +                let pane_id = press.pane_id.clone();
@@ -1186,16 +1860,40 @@ index abf97d94..26158b2d 100644
 +                let Some(press) = self.space_tree.press.take() else {
 +                    return false;
 +                };
-+                self.push_endpoint_method(
-+                    crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
-+                        pane_id: press.pane_id,
-+                    }),
-+                    outcome,
-+                );
++                if self.multi_endpoint_active() {
++                    self.focus_or_activate(
++                        press.endpoint_id,
++                        ClientEndpointFocusTarget::Pane(press.pane_id),
++                        outcome,
++                    );
++                } else {
++                    self.push_endpoint_method(
++                        crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
++                            pane_id: press.pane_id,
++                        }),
++                        outcome,
++                    );
++                }
 +                true
 +            }
 +            _ => false,
 +        }
++    }
++
++    /// Line hits of the machine being shown: the local sidebar's, or the active
++    /// machine's in the multi-machine sidebar.
++    fn active_lines(&self) -> impl Iterator<Item = (Rect, &str)> {
++        self.hits
++            .agents
++            .iter()
++            .map(|(rect, pane_id)| (*rect, pane_id.as_str()))
++            .chain(
++                self.hits
++                    .endpoint_agents
++                    .iter()
++                    .filter(|(_, endpoint_id, _)| *endpoint_id == self.active_endpoint_id)
++                    .map(|(rect, _, pane_id)| (*rect, pane_id.as_str())),
++            )
 +    }
 +
 +    /// Whether a line hit sits in the space tree rather than the needs-input list.
@@ -1226,14 +1924,12 @@ index abf97d94..26158b2d 100644
 +            return into_space(&workspace_id);
 +        }
 +        let (_, target_pane_id) = self
-+            .hits
-+            .agents
-+            .iter()
++            .active_lines()
 +            .find(|(rect, _)| super::contains(*rect, point) && self.in_space_tree(*rect))?;
 +        let target = snapshot
 +            .panes
 +            .iter()
-+            .find(|pane| pane.pane_id == *target_pane_id)?;
++            .find(|pane| pane.pane_id == target_pane_id)?;
 +        if target.workspace_id != source.workspace_id {
 +            return into_space(&target.workspace_id);
 +        }
@@ -1314,9 +2010,9 @@ index abf97d94..26158b2d 100644
 +        let Some(drag) = self.space_tree.drag.as_ref() else {
 +            return;
 +        };
-+        for (rect, pane_id) in &self.hits.agents {
-+            if *pane_id == drag.pane_id {
-+                buffer.set_style(*rect, Style::default().add_modifier(Modifier::DIM));
++        for (rect, pane_id) in self.active_lines() {
++            if pane_id == drag.pane_id {
++                buffer.set_style(rect, Style::default().add_modifier(Modifier::DIM));
 +            }
 +        }
 +        let target = match drag.target.as_ref() {
@@ -1329,11 +2025,9 @@ index abf97d94..26158b2d 100644
 +                })
 +                .map(|hit| hit.rect),
 +            Some(LineDrop::Tab { target_pane_id, .. }) => self
-+                .hits
-+                .agents
-+                .iter()
++                .active_lines()
 +                .find(|(rect, pane_id)| pane_id == target_pane_id && self.in_space_tree(*rect))
-+                .map(|(rect, _)| *rect),
++                .map(|(rect, _)| rect),
 +            None => None,
 +        };
 +        if let Some(rect) = target {
@@ -1341,14 +2035,12 @@ index abf97d94..26158b2d 100644
 +        }
 +    }
 +
-+    /// Open the space-line menu for the line under (x, y). Local machine only.
++    /// Open the space-line menu for the line under (x, y), on the machine being shown.
 +    pub(super) fn open_space_line_menu_at(&mut self, x: u16, y: u16) -> bool {
 +        let Some(pane_id) = self
-+            .hits
-+            .agents
-+            .iter()
++            .active_lines()
 +            .find(|(rect, _)| super::contains(*rect, (x, y)))
-+            .map(|(_, pane_id)| pane_id.clone())
++            .map(|(_, pane_id)| pane_id.to_owned())
 +        else {
 +            return false;
 +        };
@@ -1443,15 +2135,93 @@ index abf97d94..26158b2d 100644
 +    }
 +}
 +
- #[cfg(test)]
- mod tests {
-     use super::*;
-@@ -264,8 +1117,14 @@ mod tests {
-     #[test]
-     fn shell_count_comes_from_the_shells_token() {
-         assert_eq!(shell_count_text(&agent_with_tokens(&[])), None);
--        assert_eq!(shell_count_text(&agent_with_tokens(&[("shells", "0")])), None);
--        assert_eq!(shell_count_text(&agent_with_tokens(&[("shells", "x")])), None);
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn only_blocked_and_unread_finished_agents_want_attention() {
++        assert_eq!(
++            Attention::of(AgentStatus::Blocked),
++            Some(Attention::NeedsInput)
++        );
++        assert_eq!(Attention::of(AgentStatus::Done), Some(Attention::Finished));
++        for status in [
++            AgentStatus::Working,
++            AgentStatus::Idle,
++            AgentStatus::Unknown,
++        ] {
++            assert_eq!(Attention::of(status), None);
++        }
++    }
++
++    fn entry_names(entries: &[AttentionEntry<(&'static str, AgentStatus)>]) -> Vec<&'static str> {
++        entries
++            .iter()
++            .map(|entry| match entry {
++                AttentionEntry::Heading(attention) => attention.title(),
++                AttentionEntry::Agent((name, _)) => name,
++            })
++            .collect()
++    }
++
++    #[test]
++    fn attention_groups_most_urgent_first_with_a_heading_between() {
++        let rows = vec![
++            ("a", AgentStatus::Done),
++            ("b", AgentStatus::Blocked),
++            ("c", AgentStatus::Idle),
++            ("d", AgentStatus::Done),
++            ("e", AgentStatus::Blocked),
++        ];
++        let (title, entries) = attention_entries(rows.clone(), |row| row.1);
++        assert_eq!(title, " needs input");
++        assert_eq!(entry_names(&entries), ["b", "e", " finished", "a", "d"]);
++        // Two two-line agents, the two-line heading and two one-line agents.
++        assert_eq!(
++            attention_list_height(
++                rows,
++                |row| row.1,
++                |row| if row.1 == AgentStatus::Blocked { 2 } else { 1 },
++                0
++            ),
++            2 + 2 + 2 + 1 + 1
++        );
++
++        let (title, entries) = attention_entries(vec![("a", AgentStatus::Done)], |row| row.1);
++        assert_eq!(title, " finished");
++        assert_eq!(entry_names(&entries), ["a"]);
++        assert_eq!(
++            attention_list_height(Vec::<(&str, AgentStatus)>::new(), |row| row.1, |_| 1, 0),
++            0
++        );
++    }
++
++    fn agent_with_tokens(tokens: &[(&str, &str)]) -> ClientShellAgent {
++        ClientShellAgent {
++            pane_id: "w1:p1".into(),
++            workspace_id: "w1".into(),
++            tab_id: "w1:t1".into(),
++            name: None,
++            display_agent: None,
++            agent: Some("claude".into()),
++            title: None,
++            terminal_title: None,
++            terminal_title_stripped: None,
++            agent_status: AgentStatus::Working,
++            state_change_seq: 0,
++            state_labels: Vec::new(),
++            tokens: tokens
++                .iter()
++                .map(|(name, value)| (name.to_string(), value.to_string()))
++                .collect(),
++            focused: false,
++        }
++    }
++
++    #[test]
++    fn shell_count_comes_from_the_shells_token() {
++        assert_eq!(shell_count_text(&agent_with_tokens(&[])), None);
 +        assert_eq!(
 +            shell_count_text(&agent_with_tokens(&[("shells", "0")])),
 +            None
@@ -1460,13 +2230,65 @@ index abf97d94..26158b2d 100644
 +            shell_count_text(&agent_with_tokens(&[("shells", "x")])),
 +            None
 +        );
-         assert_eq!(
-             shell_count_text(&agent_with_tokens(&[("shells", "1")])).as_deref(),
-             Some(" · 1 shell")
-@@ -325,4 +1184,206 @@ mod tests {
-         let (_, detail, _) = sidebar_sections(area, 0.25, 100, 30);
-         assert_eq!(detail.height, 30);
-     }
++        assert_eq!(
++            shell_count_text(&agent_with_tokens(&[("shells", "1")])).as_deref(),
++            Some(" · 1 shell")
++        );
++        assert_eq!(
++            shell_count_text(&agent_with_tokens(&[("other", "9"), ("shells", "2")])).as_deref(),
++            Some(" · 2 shells")
++        );
++    }
++
++    #[test]
++    fn list_height_adds_gaps_between_entries() {
++        assert_eq!(list_height([].into_iter(), 1), 0);
++        assert_eq!(list_height([2].into_iter(), 1), 2);
++        assert_eq!(list_height([2, 0, 3].into_iter(), 1), 2 + 1 + 1 + 1 + 3);
++    }
++
++    #[test]
++    fn list_content_height_sums_heights_and_gaps() {
++        assert_eq!(list_content_height(&[], &[]), 0);
++        assert_eq!(list_content_height(&[3, 2, 4], &[1, 1, 0]), 11);
++    }
++
++    #[test]
++    fn sections_give_spaces_everything_but_the_toggle_row_without_waiting_agents() {
++        let area = Rect::new(0, 0, 27, 40);
++        let (spaces, detail, divider) = sidebar_sections(area, 0.5, 0, 10);
++        assert_eq!(spaces, Rect::new(0, 0, 26, 39));
++        assert_eq!(detail.height, 0);
++        assert!(divider.is_empty());
++    }
++
++    #[test]
++    fn needs_input_section_sits_right_under_a_short_spaces_list() {
++        let area = Rect::new(0, 0, 27, 40);
++        let (spaces, detail, divider) = sidebar_sections(area, 0.5, 4, 10);
++        assert_eq!(spaces, Rect::new(0, 0, 26, 39));
++        // 2 header rows + 10 list rows, then 3 header rows + 4 agent rows.
++        assert_eq!(detail, Rect::new(0, 12, 26, 7));
++        assert!(divider.is_empty());
++
++        // Exactly fits: 2 + 29 + 7 + 1 footer = 39.
++        let (_, detail, _) = sidebar_sections(area, 0.5, 4, 29);
++        assert_eq!(detail, Rect::new(0, 31, 26, 7));
++    }
++
++    #[test]
++    fn needs_input_section_moves_to_the_bottom_when_spaces_overflow() {
++        let area = Rect::new(0, 0, 27, 40);
++        let (spaces, detail, divider) = sidebar_sections(area, 0.5, 4, 30);
++        assert_eq!(detail, Rect::new(0, 33, 26, 7));
++        assert_eq!(spaces.height + detail.height, 40);
++        assert_eq!(divider, Rect::new(0, 33, 26, 1));
++
++        let (_, detail, _) = sidebar_sections(area, 0.5, 100, 30);
++        assert_eq!(detail.height, 20);
++        let (_, detail, _) = sidebar_sections(area, 0.25, 100, 30);
++        assert_eq!(detail.height, 30);
++    }
 +
 +    fn pane(id: &str, workspace: &str, tab: &str, dir: &str) -> ClientShellPane {
 +        ClientShellPane {
@@ -1592,10 +2414,17 @@ index abf97d94..26158b2d 100644
 +    }
 +
 +    #[test]
-+    fn agents_cycle_in_sidebar_order_needing_input_first() {
++    fn agents_cycle_in_sidebar_order_most_urgent_group_first() {
 +        let mut snapshot = fridge();
 +        assert_eq!(tree_agent_pane_ids(&snapshot), ["p1", "p2", "p5"]);
 +        assert_eq!(agent_cycle(&snapshot), ["p2", "p5"]);
++        // With nobody blocked, unread finished agents come next.
++        for agent in &mut snapshot.agents {
++            if agent.agent_status == AgentStatus::Blocked {
++                agent.agent_status = AgentStatus::Working;
++            }
++        }
++        assert_eq!(agent_cycle(&snapshot), ["p1"]);
 +        for agent in &mut snapshot.agents {
 +            agent.agent_status = AgentStatus::Working;
 +        }
@@ -1646,8 +2475,15 @@ index abf97d94..26158b2d 100644
 +        );
 +        // Clock skew between machines never shows a negative age.
 +        assert_eq!(state_age_text(&agent, since - 5_000), None);
-+        agent.agent_status = AgentStatus::Unknown;
-+        assert_eq!(state_age_text(&agent, since + 12 * 60_000), None);
++        agent.agent_status = AgentStatus::Blocked;
++        assert_eq!(
++            state_age_text(&agent, since + 12 * 60_000).as_deref(),
++            Some("12m")
++        );
++        for status in [AgentStatus::Idle, AgentStatus::Done, AgentStatus::Unknown] {
++            agent.agent_status = status;
++            assert_eq!(state_age_text(&agent, since + 12 * 60_000), None);
++        }
 +        assert_eq!(state_age_text(&agent_with_tokens(&[]), since), None);
 +    }
 +
@@ -1669,7 +2505,7 @@ index abf97d94..26158b2d 100644
 +        );
 +        assert_eq!(items[1].action, ClientContextMenuAction::MoveToSpace(0));
 +    }
- }
++}
 diff --git a/src/client/shell/state.rs b/src/client/shell/state.rs
 index 5a732920..a52bca6d 100644
 --- a/src/client/shell/state.rs
@@ -1752,10 +2588,10 @@ index 05bfc263..d89023c4 100644
  mod startup_overlays;
 diff --git a/src/client/shell/tests/space_tree.rs b/src/client/shell/tests/space_tree.rs
 new file mode 100644
-index 00000000..4baf1948
+index 00000000..01574926
 --- /dev/null
 +++ b/src/client/shell/tests/space_tree.rs
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,461 @@
 +//! Fork: mouse behavior of the space tree in the expanded sidebar.
 +
 +use super::*;
@@ -1804,7 +2640,7 @@ index 00000000..4baf1948
 +        focused: pane_id == "pane_1",
 +    };
 +    snapshot.agents = vec![
-+        agent("pane_1", "tab_1", AgentStatus::Done),
++        agent("pane_1", "tab_1", AgentStatus::Idle),
 +        agent("pane_2", "tab_2", AgentStatus::Working),
 +    ];
 +    snapshot
@@ -1993,4 +2829,227 @@ index 00000000..4baf1948
 +        .take(deploy.right() as usize)
 +        .collect::<String>();
 +    assert!(row.trim_end().ends_with("12m"), "{row}");
++}
++
++#[test]
++fn waiting_agents_are_grouped_needs_input_then_finished() {
++    let mut snapshot = tree_snapshot();
++    // The focused agent counts as read, so the unread finished one is in another tab.
++    snapshot.agents[0].agent_status = AgentStatus::Blocked;
++    snapshot.agents[1].agent_status = AgentStatus::Working;
++    snapshot.agents[1].state_change_seq = 1;
++    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
++    state.set_snapshot(Box::new(snapshot.clone()));
++    // The client marks an agent finished once it has seen it work and then stop.
++    snapshot.revision = 2;
++    snapshot.agents[1].agent_status = AgentStatus::Done;
++    snapshot.agents[1].state_change_seq = 2;
++    state.set_snapshot(Box::new(snapshot));
++    let mut surface = surface();
++    surface.projection_revision = 2;
++    state.set_pane_surface(surface);
++    let frame = state.compose(106, 30).expect("frame");
++    let sidebar = frame_rows(&frame)
++        .into_iter()
++        .map(|row| {
++            row.chars()
++                .take(24)
++                .collect::<String>()
++                .trim_end()
++                .to_owned()
++        })
++        .collect::<Vec<_>>();
++    let needs_input = sidebar
++        .iter()
++        .position(|row| row == " needs input")
++        .expect("title");
++    let finished = sidebar
++        .iter()
++        .position(|row| row == " finished")
++        .unwrap_or_else(|| panic!("{sidebar:#?}"));
++    assert!(needs_input < finished, "{sidebar:#?}");
++    // The blocked agent sits under "needs input", the finished one under "finished".
++    let blocked_row = state
++        .hits
++        .agents
++        .iter()
++        .filter(|(rect, id)| id == "pane_1" && rect.y > needs_input as u16)
++        .map(|(rect, _)| rect.y as usize)
++        .next()
++        .expect("blocked agent row");
++    let done_row = state
++        .hits
++        .agents
++        .iter()
++        .filter(|(rect, id)| id == "pane_2" && rect.y > needs_input as u16)
++        .map(|(rect, _)| rect.y as usize)
++        .next()
++        .expect("finished agent row");
++    assert!(
++        needs_input < blocked_row && blocked_row < finished && finished < done_row,
++        "{sidebar:#?}"
++    );
++}
++
++#[test]
++fn turns_finished_before_attaching_stay_unread() {
++    let mut snapshot = tree_snapshot();
++    snapshot.agents[1].agent_status = AgentStatus::Done;
++    snapshot.agents[1].state_change_seq = 7;
++    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
++    state.set_snapshot(Box::new(snapshot));
++    state.set_pane_surface(surface());
++    let frame = state.compose(106, 30).expect("frame");
++    let sidebar = frame_rows(&frame)
++        .into_iter()
++        .map(|row| {
++            row.chars()
++                .take(24)
++                .collect::<String>()
++                .trim_end()
++                .to_owned()
++        })
++        .collect::<Vec<_>>();
++    assert!(sidebar.iter().any(|row| row == " finished"), "{sidebar:#?}");
++}
++
++/// Local and a saved machine "Build", both online, each with the tree snapshot.
++fn multi_machine_state(
++    remote_status: AgentStatus,
++) -> (ClientShellState, crate::client::endpoint::ClientEndpointId) {
++    use crate::client::endpoint::{
++        ClientEndpointId, ClientEndpointStatus, ProfileId, SavedSshEndpoint,
++    };
++    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
++    let profile = SavedSshEndpoint {
++        id: ProfileId::parse("0123456789abcdef0123456789abcdef").expect("profile id"),
++        label: "Build".into(),
++        target: "dev@build.example".into(),
++        session: "agents".into(),
++        enabled: true,
++    };
++    let remote = ClientEndpointId::Ssh(profile.id.clone());
++    state.set_endpoint_catalog(&[profile]);
++    state.set_endpoint_status(&remote, ClientEndpointStatus::Online);
++    state.set_snapshot(Box::new(tree_snapshot()));
++    state.set_pane_surface(surface());
++    let mut remote_snapshot = tree_snapshot();
++    remote_snapshot.boot_id = "remote-boot".into();
++    remote_snapshot.agents[1].agent_status = remote_status;
++    state.set_endpoint_snapshot(&remote, Box::new(remote_snapshot));
++    state.compose(106, 40).expect("frame");
++    (state, remote)
++}
++
++fn machine_line(
++    state: &ClientShellState,
++    endpoint: &crate::client::endpoint::ClientEndpointId,
++    pane_id: &str,
++) -> Rect {
++    state
++        .hits
++        .endpoint_agents
++        .iter()
++        .find(|(rect, id, pane)| {
++            id == endpoint && pane == pane_id && rect.y < state.hits.agent_body.y.max(1)
++        })
++        .or_else(|| {
++            state
++                .hits
++                .endpoint_agents
++                .iter()
++                .find(|(_, id, pane)| id == endpoint && pane == pane_id)
++        })
++        .map(|(rect, _, _)| *rect)
++        .expect("machine tree line")
++}
++
++#[test]
++fn multi_machine_lines_drag_within_the_machine_being_shown() {
++    let (mut state, _) = multi_machine_state(AgentStatus::Working);
++    let local = crate::client::endpoint::ClientEndpointId::Local;
++    let source = machine_line(&state, &local, "pane_2");
++    let destination = state
++        .hits
++        .workspaces
++        .iter()
++        .find(|hit| hit.endpoint_id == local && hit.workspace_id == "ws_2")
++        .map(|hit| hit.rect)
++        .expect("local personal space");
++    mouse(&mut state, MouseEventKind::Down(MouseButton::Left), source);
++    mouse(
++        &mut state,
++        MouseEventKind::Drag(MouseButton::Left),
++        destination,
++    );
++    let up = mouse(
++        &mut state,
++        MouseEventKind::Up(MouseButton::Left),
++        destination,
++    );
++    assert!(matches!(
++        methods(&up)[..],
++        [Method::PaneMove(params)] if params.pane_id == "pane_2"
++    ));
++}
++
++#[test]
++fn multi_machine_click_switches_to_another_machines_agent_on_release() {
++    let (mut state, remote) = multi_machine_state(AgentStatus::Working);
++    let target = machine_line(&state, &remote, "pane_2");
++    let down = mouse(&mut state, MouseEventKind::Down(MouseButton::Left), target);
++    assert!(down.actions.is_empty());
++    // Dragging another machine's line does nothing; release still switches to it.
++    mouse(
++        &mut state,
++        MouseEventKind::Drag(MouseButton::Left),
++        Rect {
++            y: target.y + 1,
++            ..target
++        },
++    );
++    let up = mouse(
++        &mut state,
++        MouseEventKind::Up(MouseButton::Left),
++        Rect {
++            y: target.y + 1,
++            ..target
++        },
++    );
++    assert!(matches!(
++        up.actions.as_slice(),
++        [ClientShellAction::ActivateEndpoint {
++            endpoint_id,
++            target: Some(ClientEndpointFocusTarget::Pane(pane)),
++        }] if *endpoint_id == remote && pane == "pane_2"
++    ));
++}
++
++#[test]
++fn multi_machine_next_agent_goes_to_the_most_urgent_across_machines() {
++    let (mut state, remote) = multi_machine_state(AgentStatus::Blocked);
++    let mut outcome = ClientShellInput::default();
++    assert!(state.handle_endpoint_navigation(crate::input::KeybindAction::NextAgent, &mut outcome));
++    assert!(matches!(
++        outcome.actions.as_slice(),
++        [ClientShellAction::ActivateEndpoint {
++            endpoint_id,
++            target: Some(ClientEndpointFocusTarget::Pane(pane)),
++        }] if *endpoint_id == remote && pane == "pane_2"
++    ));
++    // focus_agent numbers follow the tree: Local's two agents, then Build's.
++    let targets = crate::client::shell::space_agents::endpoint_focus_targets(&state.endpoints);
++    let order = targets
++        .iter()
++        .map(|target| (target.endpoint_id == remote, target.pane_id.as_str()))
++        .collect::<Vec<_>>();
++    assert_eq!(
++        order,
++        [
++            (false, "pane_1"),
++            (false, "pane_2"),
++            (true, "pane_1"),
++            (true, "pane_2")
++        ]
++    );
 +}

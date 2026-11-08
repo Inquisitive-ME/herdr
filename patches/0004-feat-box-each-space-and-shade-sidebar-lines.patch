@@ -1,0 +1,1089 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Richard Swanson <rswanson05@gmail.com>
+Date: Sun, 8 Nov 2026 15:12:59 -0600
+Subject: [PATCH] feat: box each space and shade sidebar lines
+
+Each space sits in a box; neighbouring spaces share a border row,
+worktree children stay inside their parent's box, and each machine's
+spaces are boxed under its name. Sidebars narrower than 12 columns go
+without. Dragging a space below the last one marks the last box's
+bottom edge.
+
+Every other tab of a space, and every other waiting agent, is drawn a
+few percent lighter than the terminal's reported background, and the
+line under the mouse a step lighter still; the focused tab and space
+keep their highlight. Plain terminals show $ in the agent-number column
+and waiting agents carry their tree number there.
+
+Upstream's mouse_hits_use_stable_workspace_tab_and_pane_ids clicks the
+row that is now a box border and fails by design.
+
+diff --git a/src/client/shell/agent_sidebar.rs b/src/client/shell/agent_sidebar.rs
+index d1fef727..0c95c800 100644
+--- a/src/client/shell/agent_sidebar.rs
++++ b/src/client/shell/agent_sidebar.rs
+@@ -63,6 +63,7 @@ pub(super) fn render_agent_panel(
+         super::space_agents::attention_entries(agent_rows(snapshot, config, None), |row| {
+             row.status
+         });
++    let numbers = super::space_agents::agent_numbers(snapshot, config);
+     if !render_agent_panel_header(
+         buffer,
+         area,
+@@ -89,8 +90,20 @@ pub(super) fn render_agent_panel(
+             super::space_agents::AttentionEntry::Heading(attention) => {
+                 super::space_agents::render_attention_heading(buffer, rect, *attention, config)
+             }
+-            super::space_agents::AttentionEntry::Agent(row) => {
++            super::space_agents::AttentionEntry::Agent { row, shaded } => {
+                 hits.agents.push((rect, row.pane_id.clone()));
++                if *shaded {
++                    hits.shaded_rows.push(rect);
++                }
++                let rect = super::space_agents::render_attention_number(
++                    buffer,
++                    rect,
++                    3,
++                    (!numbers.is_empty())
++                        .then(|| numbers.iter().position(|pane_id| *pane_id == row.pane_id)),
++                    row.focused,
++                    &config.palette,
++                );
+                 render_agent_row(buffer, rect, row, config);
+             }
+         },
+diff --git a/src/client/shell/composition.rs b/src/client/shell/composition.rs
+index 1d644e48..72571108 100644
+--- a/src/client/shell/composition.rs
++++ b/src/client/shell/composition.rs
+@@ -235,6 +235,8 @@ impl ClientShellState {
+                 workspace_drop_indicator_row,
+             },
+         );
++        self.paint_shaded_rows(&mut buffer);
++        self.paint_sidebar_hover(&mut buffer);
+         self.paint_space_line_drag(&mut buffer);
+         self.hits.panes = surface
+             .panes
+diff --git a/src/client/shell/endpoint_agents.rs b/src/client/shell/endpoint_agents.rs
+index cbca4378..e366d369 100644
+--- a/src/client/shell/endpoint_agents.rs
++++ b/src/client/shell/endpoint_agents.rs
+@@ -58,6 +58,7 @@ pub(super) fn render_expanded(
+         agent_rows(endpoints, active_endpoint_id, config),
+         |row| row.agent.status,
+     );
++    let numbers = super::space_agents::endpoint_agent_numbers(endpoints, config);
+     if !super::agent_sidebar::render_agent_panel_header(
+         buffer,
+         area,
+@@ -83,9 +84,26 @@ pub(super) fn render_expanded(
+                     super::space_agents::render_attention_heading(buffer, rect, *attention, config);
+                     return;
+                 }
+-                super::space_agents::AttentionEntry::Agent(row) => row,
++                super::space_agents::AttentionEntry::Agent { row, shaded } => {
++                    if *shaded {
++                        hits.shaded_rows.push(rect);
++                    }
++                    row
++                }
+             };
+-            super::agent_sidebar::render_agent_row(buffer, rect, &row.agent, config);
++            let row_rect = super::space_agents::render_attention_number(
++                buffer,
++                rect,
++                4,
++                (!numbers.is_empty()).then(|| {
++                    numbers.iter().position(|(endpoint_id, pane_id)| {
++                        *endpoint_id == row.endpoint_id && *pane_id == row.agent.pane_id
++                    })
++                }),
++                row.agent.focused,
++                &config.palette,
++            );
++            super::agent_sidebar::render_agent_row(buffer, row_rect, &row.agent, config);
+             if row.stale {
+                 buffer.set_style(
+                     rect,
+diff --git a/src/client/shell/endpoint_sidebar.rs b/src/client/shell/endpoint_sidebar.rs
+index 41706629..bc193e4f 100644
+--- a/src/client/shell/endpoint_sidebar.rs
++++ b/src/client/shell/endpoint_sidebar.rs
+@@ -277,11 +277,18 @@ pub(super) fn render_expanded(
+             );
+         }
+     }
++    let boxed = super::space_agents::spaces_boxed(area.width);
+     let row_heights = rows
+         .iter()
+-        .map(|row| match row {
++        .enumerate()
++        .map(|(row_index, row)| match row {
+             Row::Endpoint(_) => 1,
+             Row::Workspace { endpoint, entry } => {
++                // A machine's last space closes its box.
++                let last = !matches!(
++                    rows.get(row_index + 1),
++                    Some(Row::Workspace { endpoint: next, .. }) if next == endpoint
++                );
+                 let endpoint = &state.endpoints[*endpoint];
+                 let collapsed_groups = collapsed_groups_for_endpoint(state, &endpoint.endpoint_id)
+                     .unwrap_or(&empty_collapsed_groups);
+@@ -308,6 +315,11 @@ pub(super) fn render_expanded(
+                                     snapshot,
+                                     &workspace.workspace_id,
+                                     collapsed_groups,
++                                ))
++                                .saturating_add(super::space_agents::space_box_rows(
++                                    boxed,
++                                    entry.indented,
++                                    last,
+                                 )),
+                         )
+                     })
+@@ -411,10 +423,17 @@ pub(super) fn render_expanded(
+         .saturating_sub(metrics.offset_from_bottom);
+     let show_scrollbar = metrics.max_offset_from_bottom > 0 && body.width > 1;
+     let content_width = body.width.saturating_sub(u16::from(show_scrollbar));
++    // Each machine's spaces are boxed, inset under its header; unboxed, they are indented.
++    let mut boxes = if boxed {
++        super::space_agents::SpaceBoxes::new(body.x + 1, content_width.saturating_sub(1), true)
++    } else {
++        super::space_agents::SpaceBoxes::new(body.x + 2, content_width.saturating_sub(2), false)
++    };
+     let mut y = body.y;
+     for (row_index, row) in rows.iter().enumerate().skip(*state.workspace_scroll) {
+         match row {
+             Row::Endpoint(index) => {
++                y = boxes.finish(buffer, y, body.bottom(), palette);
+                 if y >= body.bottom() {
+                     break;
+                 }
+@@ -473,18 +492,19 @@ pub(super) fn render_expanded(
+                     collapsed_groups,
+                 );
+                 let space_height = tokens.len().max(1).min(u16::MAX as usize) as u16;
+-                let entry_height = space_height.saturating_add(tree.height()).min(body.height);
++                let entry_height = boxes
++                    .border_rows(entry.indented)
++                    .saturating_add(space_height)
++                    .saturating_add(tree.height())
++                    .min(body.height);
+                 if y.saturating_add(entry_height) > body.bottom() {
+                     break;
+                 }
+-                let height = space_height.min(entry_height);
+-                let rect = Rect::new(body.x, y, content_width, height);
+-                let nested = Rect::new(
+-                    rect.x.saturating_add(2),
+-                    rect.y,
+-                    rect.width.saturating_sub(2),
+-                    rect.height,
+-                );
++                let content_y = boxes.start(buffer, y, entry.indented, palette);
++                let inner = boxes.inner(buffer, content_y, entry_height - (content_y - y), palette);
++                let height = space_height.min(inner.height);
++                let rect = Rect::new(body.x, content_y, inner.right() - body.x, height);
++                let nested = Rect::new(inner.x, rect.y, inner.width, rect.height);
+                 let endpoint_active = &endpoint.endpoint_id == state.active_endpoint_id;
+                 let selected = state.selected_workspace_id.is_some_and(|target| {
+                     target.matches(&endpoint.endpoint_id, &workspace.workspace_id)
+@@ -503,7 +523,7 @@ pub(super) fn render_expanded(
+                     palette,
+                 );
+                 let agent_area =
+-                    Rect::new(nested.x, rect.bottom(), nested.width, entry_height - height);
++                    Rect::new(nested.x, rect.bottom(), nested.width, inner.height - height);
+                 let summary = super::space_agents::render_space_tree(
+                     buffer,
+                     agent_area,
+@@ -522,7 +542,10 @@ pub(super) fn render_expanded(
+                             line,
+                             endpoint.endpoint_id.clone(),
+                             item.pane_id.to_owned(),
+-                        ))
++                        ));
++                        if item.shaded {
++                            hits.shaded_rows.push(line);
++                        }
+                     },
+                 );
+                 if endpoint.status != ClientEndpointStatus::Online {
+@@ -564,12 +587,21 @@ pub(super) fn render_expanded(
+                     indented: entry.indented,
+                     group_toggle,
+                 });
+-                y = y
+-                    .saturating_add(entry_height)
+-                    .saturating_add(gaps.get(row_index).copied().unwrap_or(0));
++                hits.space_ends.push((
++                    endpoint.endpoint_id.clone(),
++                    workspace.workspace_id.clone(),
++                    inner.bottom(),
++                ));
++                let gap = gaps
++                    .get(row_index)
++                    .copied()
++                    .unwrap_or(0)
++                    .min(body.bottom().saturating_sub(inner.bottom()));
++                y = boxes.inner(buffer, inner.bottom(), gap, palette).bottom();
+             }
+         }
+     }
++    boxes.finish(buffer, y, body.bottom(), palette);
+     if show_scrollbar {
+         let track = Rect::new(body.right().saturating_sub(1), body.y, 1, body.height);
+         hits.workspace_scrollbar = track;
+diff --git a/src/client/shell/mouse.rs b/src/client/shell/mouse.rs
+index 05d1f8ab..fb0a19e8 100644
+--- a/src/client/shell/mouse.rs
++++ b/src/client/shell/mouse.rs
+@@ -572,7 +572,7 @@ impl ClientShellState {
+                     .get(entry.index)
+                     .map(|workspace| workspace.workspace_id.clone())
+             });
+-            let row = last_hit.rect.bottom();
++            let row = self.space_end(last_hit);
+             if row < self.hits.new_workspace.y {
+                 slots.push((before, row));
+             }
+@@ -682,6 +682,7 @@ impl ClientShellState {
+     /// the sidebar toggle takes precedence over the agent scrollbar beneath it.
+     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent, outcome: &mut ClientShellInput) {
+         self.update_link_hover(mouse, outcome);
++        self.update_sidebar_hover(mouse, outcome);
+         let point = (mouse.column, mouse.row);
+         if self.mode == ClientShellMode::Navigate
+             && self.workspace_preview_action_blocked()
+diff --git a/src/client/shell/sidebar.rs b/src/client/shell/sidebar.rs
+index 21eea77d..48a5161a 100644
+--- a/src/client/shell/sidebar.rs
++++ b/src/client/shell/sidebar.rs
+@@ -212,9 +212,11 @@ pub(crate) fn render_sidebar(
+         Rect::new(area.right().saturating_sub(1), area.y, 1, area.height)
+     };
+     let entries = workspace_entries(snapshot, state.collapsed_groups);
++    let boxed = space_agents::spaces_boxed(area.width);
+     let row_heights = entries
+         .iter()
+-        .map(|entry| {
++        .enumerate()
++        .map(|(position, entry)| {
+             snapshot
+                 .workspaces
+                 .get(entry.index)
+@@ -233,6 +235,11 @@ pub(crate) fn render_sidebar(
+                             &workspace.workspace_id,
+                             state.collapsed_groups,
+                         ))
++                        .saturating_add(space_agents::space_box_rows(
++                            boxed,
++                            entry.indented,
++                            position + 1 == entries.len(),
++                        ))
+                 })
+                 .unwrap_or(1)
+         })
+@@ -309,6 +316,7 @@ pub(crate) fn render_sidebar(
+     let content_width = body.width.saturating_sub(u16::from(show_scrollbar));
+     let agent_numbers = space_agents::agent_numbers(snapshot, config);
+     let now_ms = space_agents::now_unix_ms();
++    let mut boxes = space_agents::SpaceBoxes::new(body.x, content_width, boxed);
+     let mut y = body.y;
+     for (entry_position, entry) in entries.iter().enumerate().skip(*state.workspace_scroll) {
+         let Some(workspace) = snapshot.workspaces.get(entry.index) else {
+@@ -319,12 +327,18 @@ pub(crate) fn render_sidebar(
+         let tree =
+             space_agents::space_tree(snapshot, &workspace.workspace_id, state.collapsed_groups);
+         let space_height = rows.len().max(1).min(u16::MAX as usize) as u16;
+-        let entry_height = space_height.saturating_add(tree.height()).min(body.height);
++        let entry_height = boxes
++            .border_rows(entry.indented)
++            .saturating_add(space_height)
++            .saturating_add(tree.height())
++            .min(body.height);
+         if y.saturating_add(entry_height) > body.bottom() {
+             break;
+         }
+-        let row_height = space_height.min(entry_height);
+-        let rect = Rect::new(body.x, y, content_width, row_height);
++        let content_y = boxes.start(buffer, y, entry.indented, palette);
++        let inner = boxes.inner(buffer, content_y, entry_height - (content_y - y), palette);
++        let row_height = space_height.min(inner.height);
++        let rect = Rect::new(inner.x, content_y, inner.width, row_height);
+         let selected = state.selected_workspace_id.is_some_and(|target| {
+             target.matches(state.active_endpoint_id, &workspace.workspace_id)
+         });
+@@ -370,13 +384,18 @@ pub(crate) fn render_sidebar(
+             indented: entry.indented,
+             group_toggle,
+         });
++        hits.space_ends.push((
++            ClientEndpointId::Local,
++            workspace.workspace_id.clone(),
++            inner.bottom(),
++        ));
+         if let Some(summary) = space_agents::render_space_tree(
+             buffer,
+             Rect::new(
+-                body.x,
++                inner.x,
+                 rect.bottom(),
+-                content_width,
+-                entry_height - row_height,
++                inner.width,
++                inner.height - row_height,
+             ),
+             if entry.indented { 8 } else { 3 },
+             &tree,
+@@ -384,7 +403,12 @@ pub(crate) fn render_sidebar(
+             true,
+             config,
+             now_ms,
+-            |line, item| hits.agents.push((line, item.pane_id.to_owned())),
++            |line, item| {
++                hits.agents.push((line, item.pane_id.to_owned()));
++                if item.shaded {
++                    hits.shaded_rows.push(line);
++                }
++            },
+         ) {
+             hits.space_toggles.push((
+                 summary,
+@@ -394,9 +418,11 @@ pub(crate) fn render_sidebar(
+         }
+         let gap = entries
+             .get(entry_position + 1)
+-            .map_or(0, |next| u16::from(!next.indented) * config.spaces.row_gap);
+-        y = y.saturating_add(entry_height + gap);
++            .map_or(0, |next| u16::from(!next.indented) * config.spaces.row_gap)
++            .min(body.bottom().saturating_sub(inner.bottom()));
++        y = boxes.inner(buffer, inner.bottom(), gap, palette).bottom();
+     }
++    boxes.finish(buffer, y, body.bottom(), palette);
+ 
+     if show_scrollbar {
+         let track = Rect::new(body.right().saturating_sub(1), body.y, 1, body.height);
+diff --git a/src/client/shell/space_agents.rs b/src/client/shell/space_agents.rs
+index b92c2c0d..0b73cdfc 100644
+--- a/src/client/shell/space_agents.rs
++++ b/src/client/shell/space_agents.rs
+@@ -6,6 +6,7 @@
+ use std::collections::HashSet;
+ 
+ use ratatui::{
++    style::Color,
+     text::{Line, Span},
+     widgets::{Paragraph, Widget},
+ };
+@@ -16,6 +17,9 @@ use crate::api::schema::AgentStatus;
+ use crate::protocol::{ClientShellAgent, ClientShellPane, ClientShellTab};
+ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+ 
++/// Marks a plain terminal in the space tree.
++const TERMINAL_GLYPH: &str = "$";
++
+ /// Rows the agent section draws above its list: divider, title, blank line.
+ const NEEDS_INPUT_HEADER_ROWS: u16 = 3;
+ 
+@@ -53,14 +57,15 @@ impl Attention {
+ pub(in crate::client::shell) enum AttentionEntry<T> {
+     /// A blank line, then the group's name.
+     Heading(Attention),
+-    Agent(T),
++    /// Every other agent of a group is `shaded`, starting unshaded.
++    Agent { row: T, shaded: bool },
+ }
+ 
+ impl<T> AttentionEntry<T> {
+     pub(in crate::client::shell) fn lines(&self, agent_lines: impl Fn(&T) -> usize) -> usize {
+         match self {
+             Self::Heading(_) => 2,
+-            Self::Agent(row) => agent_lines(row),
++            Self::Agent { row, .. } => agent_lines(row),
+         }
+     }
+ }
+@@ -83,17 +88,51 @@ pub(in crate::client::shell) fn attention_entries<T>(
+         });
+     let mut entries = Vec::with_capacity(grouped.len() + 1);
+     let mut previous = None;
++    let mut shaded = false;
+     for (attention, row) in grouped {
+         if previous.is_some_and(|previous| previous != attention) {
+             entries.push(AttentionEntry::Heading(attention));
++            shaded = false;
+         }
+         previous = Some(attention);
+-        entries.push(AttentionEntry::Agent(row));
++        entries.push(AttentionEntry::Agent { row, shaded });
++        shaded = !shaded;
+     }
+     (title, entries)
+ }
+ 
+ /// Draw a group heading on the second line of its two-line entry.
++/// Make room left of an attention row for the agent's number from the space tree, in
++/// the same column, and return the rest for the row. `number` is `None` when agents
++/// aren't numbered (the row keeps its usual place) and `Some(None)` for an agent past 9.
++pub(in crate::client::shell) fn render_attention_number(
++    buffer: &mut Buffer,
++    rect: Rect,
++    gutter: u16,
++    number: Option<Option<usize>>,
++    focused: bool,
++    palette: &Palette,
++) -> Rect {
++    let Some(number) = number.filter(|_| rect.width > gutter) else {
++        return rect;
++    };
++    let margin = Rect::new(rect.x, rect.y, gutter, rect.height);
++    if focused {
++        buffer.set_style(margin, Style::default().bg(palette.active_row_bg));
++    }
++    if let Some(index) = number {
++        put_text(
++            buffer,
++            rect.x + gutter - 1,
++            rect.y,
++            1,
++            &(index + 1).to_string(),
++            Style::default().fg(palette.overlay0),
++        );
++    }
++    Rect::new(rect.x + gutter, rect.y, rect.width - gutter, rect.height)
++}
++
+ pub(in crate::client::shell) fn render_attention_heading(
+     buffer: &mut Buffer,
+     rect: Rect,
+@@ -155,6 +194,8 @@ pub(in crate::client::shell) struct SpaceItem<'a> {
+     focused: bool,
+     /// Where the pane works, when that isn't the space's home directory.
+     place: Option<String>,
++    /// Every other tab of a space is shaded, starting unshaded.
++    pub(in crate::client::shell) shaded: bool,
+ }
+ 
+ impl SpaceItem<'_> {
+@@ -215,8 +256,12 @@ pub(in crate::client::shell) fn space_tree<'a>(
+         .iter()
+         .find_map(|tab| panes.iter().find(|pane| pane.tab_id == tab.tab_id))
+         .and_then(|pane| pane_dir(pane));
+-    let mut items = Vec::new();
++    let mut items: Vec<SpaceItem<'_>> = Vec::new();
++    // Tabs listed so far; a tab whose panes are all hidden doesn't count.
++    let mut listed_tabs = 0usize;
+     for tab in &tabs {
++        let shaded = listed_tabs % 2 == 1;
++        let listed_before = items.len();
+         let tab_panes = panes
+             .iter()
+             .filter(|pane| pane.tab_id == tab.tab_id)
+@@ -251,8 +296,10 @@ pub(in crate::client::shell) fn space_tree<'a>(
+                 label,
+                 focused: pane.focused,
+                 place,
++                shaded,
+             });
+         }
++        listed_tabs += usize::from(items.len() > listed_before);
+     }
+     // Never hide an agent the pane list doesn't cover.
+     let unlisted = snapshot
+@@ -270,7 +317,9 @@ pub(in crate::client::shell) fn space_tree<'a>(
+             label: agent_label(snapshot, agent).to_owned(),
+             focused: agent.focused,
+             place: None,
++            shaded: listed_tabs % 2 == 1,
+         });
++        listed_tabs += 1;
+     }
+     SpaceTree {
+         workspace_id,
+@@ -681,8 +730,24 @@ pub(in crate::client::shell) fn render_space_tree(
+                 } else {
+                     Style::default().fg(palette.overlay0)
+                 };
++                // A shell prompt where agents show their number, so terminal names line
++                // up with agent names instead of hanging under the agent above.
++                let in_gutter = indent >= 2;
++                if in_gutter {
++                    put_text(
++                        buffer,
++                        x - 2,
++                        y,
++                        1,
++                        TERMINAL_GLYPH,
++                        Style::default().fg(palette.overlay0),
++                    );
++                }
+                 vec![
+-                    Span::styled("›", Style::default().fg(palette.overlay0)),
++                    Span::styled(
++                        if in_gutter { " " } else { TERMINAL_GLYPH },
++                        Style::default().fg(palette.overlay0),
++                    ),
+                     Span::raw(" "),
+                     Span::styled(
+                         crate::ui::truncate_end(&item.label, width.saturating_sub(2)),
+@@ -717,6 +782,163 @@ pub(in crate::client::shell) fn render_space_tree(
+     None
+ }
+ 
++/// Narrower sidebars keep their columns for text and go without boxes.
++const MIN_BOXED_SIDEBAR_WIDTH: u16 = 12;
++
++/// Whether a sidebar this wide boxes its spaces.
++pub(in crate::client::shell) fn spaces_boxed(sidebar_width: u16) -> bool {
++    sidebar_width >= MIN_BOXED_SIDEBAR_WIDTH
++}
++
++/// The sidebar background moved `percent` toward the text colour, for the alternate-tab
++/// shade and the hover highlight. Uses the configured sidebar colour, else the
++/// terminal's reported one.
++fn sidebar_tint(
++    sidebar_bg: Color,
++    host_background: Option<crate::terminal_theme::RgbColor>,
++    percent: i32,
++) -> Option<Color> {
++    let (r, g, b) = match sidebar_bg {
++        Color::Rgb(r, g, b) => (r, g, b),
++        _ => {
++            let host = host_background?;
++            (host.r, host.g, host.b)
++        }
++    };
++    let dark = u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114 < 128_000;
++    let toward = if dark { 255 } else { 0 };
++    let mix = |channel: u8| {
++        let channel = i32::from(channel);
++        (channel + (toward - channel) * percent / 100) as u8
++    };
++    Some(Color::Rgb(mix(r), mix(g), mix(b)))
++}
++
++/// How far the tab shade moves from the background toward the text colour.
++const TAB_BAND_PERCENT: i32 = 6;
++/// The same for the line under the mouse: twice the shade, so it reads over it.
++const HOVER_PERCENT: i32 = 12;
++
++/// Rows a space's box adds to its list entry: the border above a top-level space, and
++/// the bottom border under the last space of a list.
++pub(in crate::client::shell) fn space_box_rows(boxed: bool, indented: bool, last: bool) -> u16 {
++    if boxed {
++        u16::from(!indented) + u16::from(last)
++    } else {
++        0
++    }
++}
++
++/// Draws a box around each space in the spaces list, top to bottom. Neighbouring spaces
++/// share a border row; a worktree's child spaces sit inside their parent's box.
++pub(in crate::client::shell) struct SpaceBoxes {
++    x: u16,
++    width: u16,
++    boxed: bool,
++    open: bool,
++}
++
++impl SpaceBoxes {
++    /// Boxes spanning columns `x..x + width`; unboxed, spaces use those columns as they are.
++    pub(in crate::client::shell) fn new(x: u16, width: u16, boxed: bool) -> Self {
++        Self {
++            x,
++            width,
++            boxed,
++            open: false,
++        }
++    }
++
++    /// Border rows drawn above the next space.
++    pub(in crate::client::shell) fn border_rows(&self, indented: bool) -> u16 {
++        u16::from(self.boxed && !(indented && self.open))
++    }
++
++    /// Start a space at row `y`, under a `╭─╮` or a shared `├─┤` border unless it
++    /// continues its parent's box. Returns the row its content starts on.
++    pub(in crate::client::shell) fn start(
++        &mut self,
++        buffer: &mut Buffer,
++        y: u16,
++        indented: bool,
++        palette: &Palette,
++    ) -> u16 {
++        if self.border_rows(indented) == 0 {
++            return y;
++        }
++        let corners = if self.open {
++            ("├", "┤")
++        } else {
++            ("╭", "╮")
++        };
++        self.border(buffer, y, corners, palette);
++        self.open = true;
++        y.saturating_add(1)
++    }
++
++    /// Draw the walls beside rows `y..y + height` and return the area between them.
++    pub(in crate::client::shell) fn inner(
++        &self,
++        buffer: &mut Buffer,
++        y: u16,
++        height: u16,
++        palette: &Palette,
++    ) -> Rect {
++        if !self.boxed {
++            return Rect::new(self.x, y, self.width, height);
++        }
++        let style = Style::default().fg(palette.surface1);
++        for row in y..y.saturating_add(height) {
++            put_text(buffer, self.x, row, 1, "│", style);
++            put_text(
++                buffer,
++                self.x + self.width.saturating_sub(1),
++                row,
++                1,
++                "│",
++                style,
++            );
++        }
++        Rect::new(
++            self.x.saturating_add(1),
++            y,
++            self.width.saturating_sub(2),
++            height,
++        )
++    }
++
++    /// Close an open box on row `y` if it is above `bottom`. Returns the next free row.
++    pub(in crate::client::shell) fn finish(
++        &mut self,
++        buffer: &mut Buffer,
++        y: u16,
++        bottom: u16,
++        palette: &Palette,
++    ) -> u16 {
++        if !self.open || y >= bottom {
++            return y;
++        }
++        self.border(buffer, y, ("╰", "╯"), palette);
++        self.open = false;
++        y.saturating_add(1)
++    }
++
++    fn border(&self, buffer: &mut Buffer, y: u16, (left, right): (&str, &str), palette: &Palette) {
++        if self.width < 2 {
++            return;
++        }
++        let line = format!("{left}{}{right}", "─".repeat(usize::from(self.width - 2)));
++        put_text(
++            buffer,
++            self.x,
++            y,
++            self.width,
++            &line,
++            Style::default().fg(palette.surface1),
++        );
++    }
++}
++
+ /// One row standing in for a collapsed tree: a count per agent status, then terminals.
+ fn render_summary(
+     buffer: &mut Buffer,
+@@ -756,7 +978,7 @@ fn render_summary(
+         .count();
+     if terminals > 0 {
+         spans.push(Span::styled(
+-            format!("›{terminals}"),
++            format!("{TERMINAL_GLYPH}{terminals}"),
+             Style::default().fg(palette.overlay0),
+         ));
+     }
+@@ -903,6 +1125,8 @@ pub(in crate::client::shell) struct SpaceTreeState {
+     drag: Option<LineDrag>,
+     /// Summary of the age labels last drawn, to repaint only when one changes.
+     age_marker: u64,
++    /// Where the mouse last was, for the hover highlight.
++    hover: Option<(u16, u16)>,
+ }
+ 
+ struct LinePress {
+@@ -1160,6 +1384,90 @@ impl ClientShellState {
+         }))
+     }
+ 
++    /// Shade the rows the sidebar marked (every other tab of a space, every other
++    /// waiting agent) a little lighter than the background. Only plain cells change, so
++    /// focus and selection highlights stay. Needs the real background colour: a terminal
++    /// that doesn't report it gets no shading.
++    pub(super) fn paint_shaded_rows(&self, buffer: &mut Buffer) {
++        let plain = self.config.palette.sidebar_bg;
++        let Some(shade) = sidebar_tint(plain, self.host_background, TAB_BAND_PERCENT) else {
++            return;
++        };
++        for rect in &self.hits.shaded_rows {
++            for y in rect.y..rect.bottom() {
++                for x in rect.x..rect.right() {
++                    if let Some(cell) = buffer.cell_mut((x, y)).filter(|cell| cell.bg == plain) {
++                        cell.set_bg(shade);
++                    }
++                }
++            }
++        }
++    }
++
++    /// The row just below a space's tree, where a space dropped after it would go.
++    pub(super) fn space_end(&self, hit: &WorkspaceHit) -> u16 {
++        self.hits
++            .space_ends
++            .iter()
++            .find(|(endpoint_id, workspace_id, _)| {
++                *endpoint_id == hit.endpoint_id && *workspace_id == hit.workspace_id
++            })
++            .map_or(hit.rect.bottom(), |(_, _, row)| *row)
++    }
++
++    /// The clickable sidebar line under the mouse: a machine, a space, a tree line, a
++    /// collapsed summary or a waiting agent.
++    fn hovered_line(&self) -> Option<Rect> {
++        let point = self.space_tree.hover?;
++        self.hits
++            .machines
++            .iter()
++            .map(|hit| hit.rect)
++            .chain(self.hits.workspaces.iter().map(|hit| hit.rect))
++            .chain(self.hits.agents.iter().map(|(rect, _)| *rect))
++            .chain(self.hits.endpoint_agents.iter().map(|(rect, _, _)| *rect))
++            .chain(self.hits.space_toggles.iter().map(|(rect, _, _)| *rect))
++            .find(|rect| super::contains(*rect, point))
++    }
++
++    pub(super) fn update_sidebar_hover(
++        &mut self,
++        mouse: MouseEvent,
++        outcome: &mut ClientShellInput,
++    ) {
++        let before = self.hovered_line();
++        self.space_tree.hover = Some((mouse.column, mouse.row));
++        outcome.repaint |= self.hovered_line() != before;
++    }
++
++    /// Light up the line under the mouse. Only plain and shaded cells change, so the
++    /// focused tab's and space's highlight (and a selection) stay as they are. Off while
++    /// dragging, which draws its own drop marks, and, like the shading, when the
++    /// terminal doesn't report its background.
++    pub(super) fn paint_sidebar_hover(&self, buffer: &mut Buffer) {
++        if self.chrome_drag.is_some() || self.space_tree.drag.is_some() {
++            return;
++        }
++        let plain = self.config.palette.sidebar_bg;
++        let (Some(rect), Some(hover)) = (
++            self.hovered_line(),
++            sidebar_tint(plain, self.host_background, HOVER_PERCENT),
++        ) else {
++            return;
++        };
++        let shade = sidebar_tint(plain, self.host_background, TAB_BAND_PERCENT);
++        for y in rect.y..rect.bottom() {
++            for x in rect.x..rect.right() {
++                if let Some(cell) = buffer
++                    .cell_mut((x, y))
++                    .filter(|cell| cell.bg == plain || Some(cell.bg) == shade)
++                {
++                    cell.set_bg(hover);
++                }
++            }
++        }
++    }
++
+     /// Dim the dragged line and shade where it would land.
+     pub(super) fn paint_space_line_drag(&self, buffer: &mut Buffer) {
+         let Some(drag) = self.space_tree.drag.as_ref() else {
+@@ -1315,7 +1623,7 @@ mod tests {
+             .iter()
+             .map(|entry| match entry {
+                 AttentionEntry::Heading(attention) => attention.title(),
+-                AttentionEntry::Agent((name, _)) => name,
++                AttentionEntry::Agent { row: (name, _), .. } => name,
+             })
+             .collect()
+     }
+@@ -1332,6 +1640,15 @@ mod tests {
+         let (title, entries) = attention_entries(rows.clone(), |row| row.1);
+         assert_eq!(title, " needs input");
+         assert_eq!(entry_names(&entries), ["b", "e", " finished", "a", "d"]);
++        // Every other agent is shaded, starting over in each group.
++        let shades = entries
++            .iter()
++            .filter_map(|entry| match entry {
++                AttentionEntry::Agent { shaded, .. } => Some(*shaded),
++                AttentionEntry::Heading(_) => None,
++            })
++            .collect::<Vec<_>>();
++        assert_eq!(shades, [false, true, false, true]);
+         // Two two-line agents, the two-line heading and two one-line agents.
+         assert_eq!(
+             attention_list_height(
+@@ -1523,6 +1840,47 @@ mod tests {
+             .collect()
+     }
+ 
++    #[test]
++    fn every_other_listed_tab_is_shaded_and_split_panes_share_it() {
++        let mut snapshot = fridge();
++        snapshot.panes.insert(2, pane("p2b", "ws_1", "t2", "/repo"));
++        snapshot.tabs.insert(4, tab("t6", "ws_1", Some("lidar")));
++        snapshot.panes.push(pane("p6", "ws_1", "t6", "/repo"));
++        snapshot
++            .agents
++            .push(agent("p6", "ws_1", "t6", AgentStatus::Idle));
++        let shades = |tree: &SpaceTree<'_>| {
++            tree.items
++                .iter()
++                .map(|item| (item.pane_id.to_owned(), item.shaded))
++                .collect::<Vec<_>>()
++        };
++        let expect = |rows: &[(&str, bool)]| {
++            rows.iter()
++                .map(|(pane, shaded)| ((*pane).to_owned(), *shaded))
++                .collect::<Vec<_>>()
++        };
++        let tree = space_tree(&snapshot, "ws_1", &HashSet::new());
++        assert_eq!(
++            shades(&tree),
++            expect(&[
++                ("p1", false),
++                ("p2", true),
++                ("p2b", true),
++                ("p3", false),
++                ("p4", true),
++                ("p6", false),
++            ])
++        );
++        // Tabs whose terminals are hidden don't count.
++        let hidden = HashSet::from([terminals_hidden_key("ws_1")]);
++        let tree = space_tree(&snapshot, "ws_1", &hidden);
++        assert_eq!(
++            shades(&tree),
++            expect(&[("p1", false), ("p2", true), ("p6", false)])
++        );
++    }
++
+     #[test]
+     fn space_tree_lists_tabs_in_order_with_terminals_and_places() {
+         let snapshot = fridge();
+diff --git a/src/client/shell/state.rs b/src/client/shell/state.rs
+index a52bca6d..8d97eb91 100644
+--- a/src/client/shell/state.rs
++++ b/src/client/shell/state.rs
+@@ -97,6 +97,10 @@ pub(super) struct ShellHitMap {
+     pub(super) endpoint_agents: Vec<(Rect, ClientEndpointId, String)>,
+     /// Fork: toggles that collapse a space's tree, with the collapsed-group key they flip.
+     pub(super) space_toggles: Vec<(Rect, ClientEndpointId, String)>,
++    /// Fork: sidebar rows drawn on a slightly lighter shade (alternate tabs and agents).
++    pub(super) shaded_rows: Vec<Rect>,
++    /// Fork: the row just below each space's tree (its box's bottom edge when boxed).
++    pub(super) space_ends: Vec<(ClientEndpointId, String, u16)>,
+     pub(super) agent_body: Rect,
+     pub(super) agent_scrollbar: Rect,
+     pub(super) agent_scroll_metrics: Option<crate::pane::ScrollMetrics>,
+diff --git a/src/client/shell/tests/space_tree.rs b/src/client/shell/tests/space_tree.rs
+index 01574926..38a00c61 100644
+--- a/src/client/shell/tests/space_tree.rs
++++ b/src/client/shell/tests/space_tree.rs
+@@ -459,3 +459,193 @@ fn multi_machine_next_agent_goes_to_the_most_urgent_across_machines() {
+         ]
+     );
+ }
++
++fn cell(frame: &FrameData, x: u16, y: u16) -> &str {
++    &frame.cells[usize::from(y) * usize::from(frame.width) + usize::from(x)].symbol
++}
++
++#[test]
++fn each_space_sits_in_a_box_sharing_borders_with_its_neighbours() {
++    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
++    state.set_snapshot(Box::new(tree_snapshot()));
++    state.set_pane_surface(surface());
++    let frame = state.compose(106, 30).expect("frame");
++    let first = space(&state, "ws_1");
++    let second = space(&state, "ws_2");
++    let deploy = line(&state, "pane_2");
++    let last = line(&state, "pane_3");
++    let edges = |y| (cell(&frame, first.x - 1, y), cell(&frame, first.right(), y));
++    assert_eq!(edges(first.y - 1), ("╭", "╮"));
++    assert_eq!(edges(deploy.y), ("│", "│"));
++    assert_eq!(second.y - 1, deploy.bottom());
++    assert_eq!(edges(second.y - 1), ("├", "┤"));
++    assert_eq!(edges(last.bottom()), ("╰", "╯"));
++}
++
++#[test]
++fn each_machine_closes_its_spaces_box_before_the_next_machine() {
++    let (mut state, remote) = multi_machine_state(AgentStatus::Working);
++    let frame = state.compose(106, 40).expect("frame");
++    let local_last = machine_line(
++        &state,
++        &crate::client::endpoint::ClientEndpointId::Local,
++        "pane_3",
++    );
++    let remote_first = machine_line(&state, &remote, "pane_1");
++    let remote_space = state
++        .hits
++        .workspaces
++        .iter()
++        .find(|hit| hit.endpoint_id == remote && hit.workspace_id == "ws_1")
++        .map(|hit| hit.rect)
++        .expect("remote space");
++    let edges = |line: Rect, y| (cell(&frame, line.x - 1, y), cell(&frame, line.right(), y));
++    assert_eq!(edges(local_last, local_last.bottom()), ("╰", "╯"));
++    assert!(state
++        .hits
++        .machines
++        .iter()
++        .any(|machine| machine.endpoint_id == remote && machine.rect.y == local_last.bottom() + 1));
++    assert_eq!(edges(remote_first, remote_space.y - 1), ("╭", "╮"));
++    assert_eq!(edges(remote_first, remote_first.y), ("│", "│"));
++}
++
++#[test]
++fn alternate_tabs_are_shaded_and_waiting_agents_numbered_like_the_tree() {
++    let mut config = Config::default();
++    config.keys.focus_agent = crate::config::BindingConfig::one("ctrl+alt+1");
++    let mut snapshot = tree_snapshot();
++    snapshot.agents[0].agent_status = AgentStatus::Blocked;
++    snapshot.agents[1].agent_status = AgentStatus::Blocked;
++    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
++    state.set_snapshot(Box::new(snapshot));
++    state.set_pane_surface(surface());
++    let plain = state.config.palette.sidebar_bg;
++    let tree_line = |state: &ClientShellState, pane_id: &str| {
++        state
++            .hits
++            .agents
++            .iter()
++            .find(|(rect, id)| id == pane_id && rect.y < state.hits.agent_body.y)
++            .map(|(rect, _)| *rect)
++            .expect("tree line")
++    };
++    let waiting = |state: &ClientShellState, pane_id: &str| {
++        state
++            .hits
++            .agents
++            .iter()
++            .find(|(rect, id)| id == pane_id && rect.y >= state.hits.agent_body.y)
++            .map(|(rect, _)| *rect)
++            .expect("waiting row")
++    };
++    let bg =
++        |frame: &FrameData, x: u16, y: u16| frame.to_ratatui_buffer().expect("buffer")[(x, y)].bg;
++
++    // Without the terminal's background colour there is nothing to shade from.
++    let frame = state.compose(106, 30).expect("frame");
++    let deploy = tree_line(&state, "pane_2");
++    assert_eq!(bg(&frame, deploy.right() - 1, deploy.y), plain);
++
++    state.host_background = Some(crate::terminal_theme::RgbColor {
++        r: 0x23,
++        g: 0x26,
++        b: 0x27,
++    });
++    let frame = state.compose(106, 30).expect("frame");
++    let shade = ratatui::style::Color::Rgb(48, 51, 51);
++    // ws_1's second tab is shaded; ws_2's first tab (a terminal) starts over.
++    let deploy = tree_line(&state, "pane_2");
++    let server = tree_line(&state, "pane_3");
++    assert_eq!(bg(&frame, deploy.right() - 1, deploy.y), shade);
++    assert_eq!(bg(&frame, server.right() - 1, server.y), plain);
++    // The terminal's prompt sits where agents show their number.
++    assert_eq!(cell(&frame, deploy.x + 1, deploy.y), "2");
++    assert_eq!(cell(&frame, server.x + 1, server.y), "$");
++
++    // Waiting agents carry their tree number in the same column; one of the two is shaded.
++    let first = waiting(&state, "pane_1");
++    let second = waiting(&state, "pane_2");
++    assert_eq!(cell(&frame, first.x + 2, first.y), "1");
++    assert_eq!(cell(&frame, second.x + 2, second.y), "2");
++    assert_eq!(first.x + 2, deploy.x + 1);
++    let shaded = [first, second]
++        .iter()
++        .filter(|rect| bg(&frame, rect.right() - 1, rect.y) == shade)
++        .count();
++    assert_eq!(shaded, 1);
++}
++
++#[test]
++fn a_space_dropped_last_marks_the_bottom_of_the_last_box() {
++    let mut state = tree_state();
++    let first = state.hits.workspaces[0].rect;
++    let last_line = line(&state, "pane_3");
++    let bottom = last_line.bottom();
++    let frame = state.compose(106, 30).expect("frame");
++    assert_eq!(cell(&frame, state.hits.workspace_body.x, bottom), "╰");
++
++    mouse(&mut state, MouseEventKind::Down(MouseButton::Left), first);
++    mouse(
++        &mut state,
++        MouseEventKind::Drag(MouseButton::Left),
++        last_line,
++    );
++    assert!(matches!(
++        state.chrome_drag,
++        Some(ClientChromeDrag::Workspace {
++            target: Some((None, row)),
++            ..
++        }) if row == bottom
++    ));
++    // The marker replaces the box's bottom edge, not the last tab's line.
++    let frame = state.compose(106, 30).expect("frame");
++    assert_eq!(cell(&frame, state.hits.workspace_body.x, bottom), "─");
++    assert_eq!(cell(&frame, last_line.x + 1, last_line.y), "$");
++}
++
++#[test]
++fn the_line_under_the_mouse_lights_up_but_the_focused_tab_keeps_its_highlight() {
++    let mut state = tree_state();
++    state.host_background = Some(crate::terminal_theme::RgbColor {
++        r: 0x23,
++        g: 0x26,
++        b: 0x27,
++    });
++    let palette = state.config.palette.clone();
++    let hover = ratatui::style::Color::Rgb(61, 64, 64);
++    let shade = ratatui::style::Color::Rgb(48, 51, 51);
++    let bg = |state: &mut ClientShellState, rect: Rect| {
++        let frame = state.compose(106, 30).expect("frame");
++        frame.to_ratatui_buffer().expect("buffer")[(rect.right() - 1, rect.y)].bg
++    };
++    let focused = line(&state, "pane_1");
++    let deploy = line(&state, "pane_2");
++    let personal = state.hits.workspaces[1].rect;
++    assert_eq!(bg(&mut state, deploy), shade);
++
++    assert!(mouse(&mut state, MouseEventKind::Moved, deploy).repaint);
++    assert_eq!(bg(&mut state, deploy), hover);
++    // Moving within the same line doesn't repaint.
++    let along = Rect {
++        x: deploy.x + 1,
++        ..deploy
++    };
++    assert!(!mouse(&mut state, MouseEventKind::Moved, along).repaint);
++
++    // The focused tab and space keep their own highlight under the mouse.
++    let focused_space = state.hits.workspaces[0].rect;
++    mouse(&mut state, MouseEventKind::Moved, focused);
++    assert_eq!(bg(&mut state, focused), palette.active_row_bg);
++    mouse(&mut state, MouseEventKind::Moved, focused_space);
++    assert_eq!(bg(&mut state, focused_space), palette.active_row_bg);
++
++    mouse(&mut state, MouseEventKind::Moved, personal);
++    assert_eq!(bg(&mut state, personal), hover);
++    assert_eq!(bg(&mut state, deploy), shade);
++
++    // Off the sidebar nothing is lit.
++    let pane = state.hits.panes[0].inner_rect;
++    assert!(mouse(&mut state, MouseEventKind::Moved, pane).repaint);
++    assert_eq!(bg(&mut state, personal), palette.sidebar_bg);
++}
