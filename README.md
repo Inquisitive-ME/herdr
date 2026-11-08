@@ -36,6 +36,16 @@ The installer verifies the SHA-256 checksum and replaces the `herdr` on PATH
 atomically (a running herdr keeps working), or installs to `~/.local/bin/herdr`
 if none exists. Set `HERDR_INSTALL_DIR` to choose another directory.
 
+Options go after `sh -s --` when piping, e.g. `... | sh -s -- --with-shell-count`:
+
+- `--with-shell-count` also installs the [shell-count watcher](extras/shell-count).
+  Once it's installed, later installs update it too.
+- `--uninstall` lists what it will do, asks, then removes herdr's agent integrations
+  (such as the Claude hooks), the shell-count watcher, stops running herdr sessions
+  (closing their panes and agents) and deletes the herdr binary. Run it outside
+  herdr. Add `--purge` to also delete `~/.config/herdr` (config, saved sessions,
+  logs) and `--yes` to skip the question.
+
 After the first patched install, `herdr update` follows this repository's
 `latest.json`. Upstream compares the Cargo version, so patch-only rebuilds of the same version
 require rerunning the installer.

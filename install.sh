@@ -1,14 +1,33 @@
 #!/bin/sh
 # Adapted from herdrdev/herdr's Apache-2.0 distribution/install.sh.
+#
+# Install or update herdr from Inquisitive-ME/herdr releases:
+#   curl -fsSL https://raw.githubusercontent.com/Inquisitive-ME/herdr/main/install.sh | sh
+# Pass options after `sh -s --` when piping, e.g. `| sh -s -- --with-shell-count`:
+#   --with-shell-count  also install the shell-count watcher (extras/shell-count);
+#                       once installed, later runs update it too
+#   --uninstall         stop herdr, remove its agent integrations, the watcher and
+#                       the herdr binary
+#   --purge             with --uninstall, also delete herdr's config, saved sessions
+#                       and logs
+#   --yes               don't ask before uninstalling
 set -eu
 
 MANIFEST_URL="https://github.com/Inquisitive-ME/herdr/releases/latest/download/latest.json"
+EXTRAS_URL="https://raw.githubusercontent.com/Inquisitive-ME/herdr/main/extras/shell-count"
+SHELL_COUNT_BIN="$HOME/.local/bin/herdr-shell-count"
+SHELL_COUNT_LABEL="com.inquisitive-me.herdr-shell-count"
 
 log() { printf '  > %s\n' "$1"; }
 err() { printf 'error: %s\n' "$1" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || err "requires '$1'"; }
 
-main() {
+TMP=""
+EXTRAS_TMP=""
+trap 'rm -f "$TMP"; rm -rf "$EXTRAS_TMP"' 0
+trap 'exit 1' HUP INT TERM
+
+install_herdr() {
     need curl
     need awk
     OS=$(uname -s)
@@ -47,7 +66,7 @@ main() {
         }
     ')
     VERSION=$(printf '%s\n' "$MANIFEST" | awk -F '"' '/^[[:space:]]*"version"[[:space:]]*:/ { print $4; exit }')
-    [ -n "$URL" ] || err "manifest has no asset for $TARGET"
+    [ -n "$URL" ] || err "no build for $TARGET (this fork builds Linux x86_64/aarch64 and Apple Silicon macOS)"
     case "$URL" in https://*) ;; *) err "asset URL must use HTTPS" ;; esac
     [ -n "$VERSION" ] || err "manifest has no version"
     [ "${#SHA256}" -eq 64 ] || err "manifest has no valid SHA-256 for $TARGET"
@@ -80,8 +99,6 @@ main() {
 
     # Staging on the destination filesystem lets rename replace a running executable.
     TMP=$(mktemp "$INSTALL_DIR/.herdr.XXXXXXXX")
-    trap 'rm -f "$TMP"' 0
-    trap 'exit 1' HUP INT TERM
     log "downloading v$VERSION..."
     curl -fsSL --retry 3 --connect-timeout 10 --max-time 120 "$URL" -o "$TMP" \
         || err "download failed from $URL"
@@ -100,4 +117,135 @@ main() {
     esac
 }
 
-main "$@"
+install_shell_count() {
+    log "installing the shell-count watcher..."
+    EXTRAS_TMP=$(mktemp -d)
+    for file in install.sh herdr-shell-count.py herdr-shell-count.service "$SHELL_COUNT_LABEL.plist"; do
+        curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 "$EXTRAS_URL/$file" -o "$EXTRAS_TMP/$file" \
+            || err "cannot download $EXTRAS_URL/$file"
+    done
+    # Its installer looks herdr up on PATH, which may not include a fresh install dir yet.
+    PATH="$INSTALL_DIR:$PATH" sh "$EXTRAS_TMP/install.sh"
+}
+
+remove_shell_count() {
+    case "$(uname -s)" in
+        Linux)
+            if command -v systemctl >/dev/null 2>&1; then
+                systemctl --user disable --now herdr-shell-count.service >/dev/null 2>&1 || true
+            fi
+            rm -f "$HOME/.config/systemd/user/herdr-shell-count.service"
+            if command -v systemctl >/dev/null 2>&1; then
+                systemctl --user daemon-reload >/dev/null 2>&1 || true
+            fi
+            ;;
+        Darwin)
+            launchctl bootout "gui/$(id -u)/$SHELL_COUNT_LABEL" >/dev/null 2>&1 || true
+            rm -f "$HOME/Library/LaunchAgents/$SHELL_COUNT_LABEL.plist"
+            ;;
+    esac
+    rm -f "$SHELL_COUNT_BIN"
+}
+
+confirm() {
+    [ "$YES" = 0 ] || return 0
+    printf 'Continue? [y/N] ' >/dev/tty 2>/dev/null || err "no terminal to confirm on; rerun with --yes"
+    answer=""
+    read -r answer </dev/tty || true
+    case "$answer" in
+        y|Y|yes|YES) ;;
+        *) err "cancelled; nothing was changed" ;;
+    esac
+}
+
+uninstall() {
+    # Stopping herdr from inside it would kill this very shell halfway through.
+    [ "${HERDR_ENV:-}" != 1 ] || err "run --uninstall outside herdr (detach with Ctrl+b q first)"
+    if [ -n "${HERDR_INSTALL_DIR:-}" ] && [ -e "$HERDR_INSTALL_DIR/herdr" ]; then
+        HERDR="$HERDR_INSTALL_DIR/herdr"
+    else
+        HERDR=$(command -v herdr 2>/dev/null || true)
+    fi
+    CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/herdr"
+    integrations=""
+    sessions=""
+    if [ -n "$HERDR" ]; then
+        # Lines look like "claude: current (v11) (...)" or "pi: not installed (...)".
+        integrations=$("$HERDR" integration status 2>/dev/null | awk -F': ' '
+            NF > 1 && $2 !~ /^not installed/ { sub(/ \(.*$/, "", $1); printf "%s ", $1 }') || true
+        sessions=$("$HERDR" session list --json 2>/dev/null | tr '{' '\n' | awk '
+            /"running":true/ && match($0, /"name":"[^"]*"/) {
+                printf "%s ", substr($0, RSTART + 8, RLENGTH - 9) }') || true
+    fi
+    watcher=0
+    if [ -e "$SHELL_COUNT_BIN" ] || [ -e "$HOME/.config/systemd/user/herdr-shell-count.service" ] \
+        || [ -e "$HOME/Library/LaunchAgents/$SHELL_COUNT_LABEL.plist" ]; then
+        watcher=1
+    fi
+    purge=0
+    if [ "$PURGE" = 1 ] && [ -e "$CONFIG_DIR" ]; then
+        purge=1
+    fi
+    if [ -z "$HERDR" ] && [ "$watcher" = 0 ] && [ "$purge" = 0 ]; then
+        log "herdr is not installed; nothing to remove"
+        return 0
+    fi
+
+    echo "This will:"
+    [ -z "$sessions" ] || echo "  - stop running herdr sessions (${sessions% }), closing all their panes and agents"
+    [ -z "$integrations" ] || echo "  - remove herdr's agent integrations: ${integrations% }"
+    [ "$watcher" = 0 ] || echo "  - remove the shell-count watcher"
+    [ -z "$HERDR" ] || echo "  - delete $HERDR"
+    [ "$purge" = 0 ] || echo "  - delete $CONFIG_DIR (config, saved sessions, logs)"
+    confirm
+
+    for name in $integrations; do
+        "$HERDR" integration uninstall "$name" >/dev/null 2>&1 \
+            && log "removed the $name integration" || log "could not remove the $name integration"
+    done
+    if [ "$watcher" = 1 ]; then
+        remove_shell_count
+        log "removed the shell-count watcher"
+    fi
+    for session in $sessions; do
+        "$HERDR" session stop "$session" >/dev/null 2>&1 \
+            && log "stopped session $session" || log "could not stop session $session"
+    done
+    if [ -n "$HERDR" ]; then
+        rm -f "$HERDR"
+        log "deleted $HERDR"
+    fi
+    if [ "$purge" = 1 ]; then
+        rm -rf "$CONFIG_DIR"
+        log "deleted $CONFIG_DIR"
+    elif [ -e "$CONFIG_DIR" ]; then
+        log "kept $CONFIG_DIR (rerun with --uninstall --purge to delete it)"
+    fi
+}
+
+WITH_SHELL_COUNT=0
+UNINSTALL=0
+PURGE=0
+YES=0
+for argument in "$@"; do
+    case "$argument" in
+        --with-shell-count) WITH_SHELL_COUNT=1 ;;
+        --uninstall) UNINSTALL=1 ;;
+        --purge) PURGE=1 ;;
+        --yes|-y) YES=1 ;;
+        -h|--help) sed -n '2,15p' "$0" 2>/dev/null || true; exit 0 ;;
+        *) err "unknown option: $argument" ;;
+    esac
+done
+[ "$PURGE" = 0 ] || [ "$UNINSTALL" = 1 ] || err "--purge only works with --uninstall"
+[ "$UNINSTALL" = 0 ] || [ "$WITH_SHELL_COUNT" = 0 ] || err "--with-shell-count can't be combined with --uninstall"
+
+if [ "$UNINSTALL" = 1 ]; then
+    uninstall
+else
+    install_herdr
+    # Keep an installed watcher in step with the herdr it belongs to.
+    if [ "$WITH_SHELL_COUNT" = 1 ] || [ -e "$SHELL_COUNT_BIN" ]; then
+        install_shell_count
+    fi
+fi

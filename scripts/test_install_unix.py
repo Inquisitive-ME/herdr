@@ -37,20 +37,34 @@ esac
 ''')
         self.write_command("curl", '''#!/bin/sh
 out=""
+url=""
 previous=""
 for argument in "$@"; do
     if [ "$previous" = "-o" ]; then out="$argument"; fi
+    case "$argument" in https://*) url="$argument" ;; esac
     previous="$argument"
 done
-if [ -n "$out" ]; then cp "$FAKE_PAYLOAD" "$out"; else cat "$FAKE_MANIFEST"; fi
+case "$url" in
+    */extras/shell-count/install.sh)
+        printf '#!/bin/sh\\necho "watcher installed with herdr at $(command -v herdr)" >> "$FAKE_LOG"\\n' > "$out" ;;
+    */extras/*) echo "extra file" > "$out" ;;
+    *) if [ -n "$out" ]; then cp "$FAKE_PAYLOAD" "$out"; else cat "$FAKE_MANIFEST"; fi ;;
+esac
 ''')
+        # Fake herdr and systemctl that only log what they're asked to do.
+        self.log = self.root / "calls.log"
+        self.home = self.root / "home"
+        self.home.mkdir()
+        for command in ("tr", "sh", "sed"):
+            (self.bin / command).symlink_to(shutil.which(command))
+        self.write_command("systemctl", '#!/bin/sh\necho "systemctl $*" >> "$FAKE_LOG"\n')
 
     def write_command(self, name, content):
         path = self.bin / name
         path.write_text(content)
         path.chmod(0o755)
 
-    def run_installer(self, checksum=None, tool="sha256sum", on_path=False, extra=None):
+    def run_installer(self, *args, checksum=None, tool="sha256sum", on_path=False, extra=None):
         for name in ("sha256sum", "shasum", "openssl"):
             (self.bin / name).unlink(missing_ok=True)
         command = shutil.which(tool)
@@ -63,11 +77,39 @@ if [ -n "$out" ]; then cp "$FAKE_PAYLOAD" "$out"; else cat "$FAKE_MANIFEST"; fi
             "assets": {k: f"https://example.invalid/herdr-{k}" for k in keys},
             "sha256": {k: self.checksum.upper() if checksum is None else checksum for k in keys},
         }, indent=2) + "\n")
-        env = {**os.environ, "PATH": str(self.bin), "HERDR_INSTALL_DIR": str(self.install),
-               "FAKE_PAYLOAD": str(self.payload), "FAKE_MANIFEST": str(self.snapshot), **(extra or {})}
+        # Tests may run inside herdr; don't let its environment leak into the installer.
+        base = {k: v for k, v in os.environ.items() if k not in ("HERDR_ENV", "XDG_CONFIG_HOME")}
+        env = {**base, "PATH": str(self.bin), "HERDR_INSTALL_DIR": str(self.install),
+               "FAKE_PAYLOAD": str(self.payload), "FAKE_MANIFEST": str(self.snapshot),
+               "FAKE_LOG": str(self.log), "HOME": str(self.home), **(extra or {})}
         if on_path:
             env.pop("HERDR_INSTALL_DIR", None)
-        return subprocess.run(["/bin/sh", str(INSTALLER)], env=env, capture_output=True, text=True)
+        return subprocess.run(["/bin/sh", str(INSTALLER), *args], env=env, capture_output=True, text=True)
+
+    def calls(self):
+        return self.log.read_text() if self.log.exists() else ""
+
+    def fake_installed_herdr(self):
+        """A herdr in the install dir with claude installed and two running sessions."""
+        self.install.mkdir(exist_ok=True)
+        herdr = self.install / "herdr"
+        herdr.write_text('''#!/bin/sh
+echo "herdr $*" >> "$FAKE_LOG"
+case "$1 $2" in
+    "integration status") printf 'pi: not installed (x)\\nclaude: current (v11) (y)\\nletta (experimental): current (v1) (z)\\n' ;;
+    "session list") echo '{"sessions":[{"default":true,"name":"default","running":true},{"name":"old","running":false},{"name":"work","running":true}]}' ;;
+esac
+''')
+        herdr.chmod(0o755)
+        return herdr
+
+    def fake_watcher(self):
+        files = [self.home / ".local/bin/herdr-shell-count",
+                 self.home / ".config/systemd/user/herdr-shell-count.service"]
+        for path in files:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x")
+        return files
 
     def test_platforms_and_checksum_tools(self):
         for platform, arch in (("Linux", "x86_64"), ("Linux", "aarch64"), ("Darwin", "x86_64"), ("Darwin", "arm64")):
@@ -108,6 +150,72 @@ if [ -n "$out" ]; then cp "$FAKE_PAYLOAD" "$out"; else cat "$FAKE_MANIFEST"; fi
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Android/Termux", result.stderr)
         self.assertFalse(self.install.exists())
+
+    def test_with_shell_count_installs_the_watcher_next_to_herdr(self):
+        result = self.run_installer("--with-shell-count")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.install / "herdr").read_bytes(), self.payload.read_bytes())
+        self.assertIn(f"watcher installed with herdr at {self.install}/herdr", self.calls())
+
+    def test_plain_install_skips_the_watcher_unless_already_installed(self):
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("watcher installed", self.calls())
+        self.fake_watcher()
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("watcher installed", self.calls())
+
+    def test_uninstall_removes_integrations_watcher_sessions_and_binary(self):
+        herdr = self.fake_installed_herdr()
+        watcher = self.fake_watcher()
+        config = self.home / ".config/herdr"
+        config.mkdir(parents=True)
+        result = self.run_installer("--uninstall", "--yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertIn("herdr integration uninstall claude", calls)
+        self.assertIn("herdr integration uninstall letta", calls)
+        self.assertNotIn("integration uninstall pi", calls)
+        self.assertIn("herdr session stop default", calls)
+        self.assertIn("herdr session stop work", calls)
+        self.assertNotIn("session stop old", calls)
+        self.assertIn("systemctl --user disable --now herdr-shell-count.service", calls)
+        self.assertFalse(herdr.exists())
+        for path in watcher:
+            self.assertFalse(path.exists())
+        self.assertTrue(config.exists(), "config is kept without --purge")
+        self.assertIn("--purge", result.stdout)
+
+    def test_uninstall_purge_deletes_config(self):
+        self.fake_installed_herdr()
+        config = self.home / ".config/herdr"
+        (config / "sessions").mkdir(parents=True)
+        result = self.run_installer("--uninstall", "--purge", "--yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(config.exists())
+
+    def test_uninstall_refuses_inside_herdr_and_without_confirmation(self):
+        herdr = self.fake_installed_herdr()
+        result = self.run_installer("--uninstall", "--yes", extra={"HERDR_ENV": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("outside herdr", result.stderr)
+        setsid = shutil.which("setsid")
+        if setsid is None:
+            self.skipTest("setsid is unavailable")
+        result = subprocess.run(
+            [setsid, "-w", "/bin/sh", str(INSTALLER), "--uninstall"],  # no controlling terminal
+            env={"PATH": str(self.bin), "HOME": str(self.home), "HERDR_INSTALL_DIR": str(self.install),
+                 "FAKE_LOG": str(self.log)},
+            capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(herdr.exists(), "nothing is removed without confirmation")
+        self.assertNotIn("uninstall claude", self.calls())
+
+    def test_purge_requires_uninstall(self):
+        result = self.run_installer("--purge")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--purge only works with --uninstall", result.stderr)
 
 
 if __name__ == "__main__":
