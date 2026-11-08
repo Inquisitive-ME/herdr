@@ -214,6 +214,10 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git checkout -q -B "$branch"
           git add -A patches UPSTREAM_BASE
+          if git diff --cached --quiet; then
+            echo "The queue already matches $NEW_TAG; nothing to propose."
+            exit 0
+          fi
           git commit -q -m "Rebase patches onto $NEW_TAG" \
             -m "Resolved automatically by Claude in run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID."
           git push -f origin "$branch"
