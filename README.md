@@ -16,37 +16,28 @@ The patches in `patches/`:
 2. **Updates from this repo.** `herdr update`, background version checks and
    remote installs read this repository's `latest.json` instead of herdr.dev.
 
-Install on Linux or macOS:
+Builds: Linux x86_64, Linux ARM (aarch64) and Apple Silicon macOS. There are no
+Windows or Intel Mac builds; use upstream herdr there.
+
+Install:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Inquisitive-ME/herdr/main/install.sh | sh
 ```
 
-Install on Windows in PowerShell:
-
-```powershell
-irm https://raw.githubusercontent.com/Inquisitive-ME/herdr/main/install.ps1 | iex
-```
-
-The installers verify SHA-256 checksums. Unix replaces the `herdr` on PATH
-atomically, or installs to `~/.local/bin/herdr` if none exists. Set
-`HERDR_INSTALL_DIR` to choose another directory. Windows follows upstream's
-`HERDR_HOME` (default `~/.herdr`) package layout, keeps releases under
-`packages/standalone/releases`, and updates the user and current session PATH.
-Its visible bin junction defaults to `%LOCALAPPDATA%\Programs\Herdr\bin`;
-`HERDR_INSTALL_DIR` overrides that junction location. Windows ARM64 uses the
-x86_64 package under emulation, as upstream does.
+The installer verifies the SHA-256 checksum and replaces the `herdr` on PATH
+atomically (a running herdr keeps working), or installs to `~/.local/bin/herdr`
+if none exists. Set `HERDR_INSTALL_DIR` to choose another directory.
 
 After the first patched install, `herdr update` follows this repository's
 `latest.json`. Upstream compares the Cargo version, so patch-only rebuilds of the same version
-require rerunning the installer. Windows uses a checksum in its install directory
-name so those reinstalls pick up changed packages too.
+require rerunning the installer.
 
 CI checks daily and on queue/script changes. It picks the latest published stable
 upstream version and publishes `<upstream_tag>-tree.<8-digit-patch-sha256>`.
 The hash covers the concatenated bytes of `patches/*.patch` in filename order.
 Existing release tags are skipped; a manual run can select `upstream_tag` and
-set `force` to replace the assets. The release includes five platform assets,
+set `force` to replace the assets. The release includes the three platform assets,
 `latest.json`, and `SHA256SUMS` (covering the assets and manifest).
 
 When patches stop applying, CI opens an issue titled `Patches don't apply to
@@ -80,5 +71,5 @@ python3 -B -m unittest discover -s scripts -p 'test_*.py'
 ```
 
 herdr is developed by [herdrdev/herdr](https://github.com/herdrdev/herdr) and
-licensed under Apache-2.0. The Unix and Windows installers are adapted from
-upstream's distribution scripts. See [LICENSE](LICENSE).
+licensed under Apache-2.0. The installer is adapted from upstream's
+distribution script. See [LICENSE](LICENSE).

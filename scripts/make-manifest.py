@@ -14,12 +14,11 @@ from pathlib import Path
 from urllib.parse import quote
 
 UPSTREAM_MANIFEST_URL = "https://herdr.dev/latest.json"
+# Only the platforms this fork builds; herdr's updater looks up just its own key.
 ASSETS = {
     "linux-x86_64": "herdr-linux-x86_64",
     "linux-aarch64": "herdr-linux-aarch64",
-    "macos-x86_64": "herdr-macos-x86_64",
     "macos-aarch64": "herdr-macos-aarch64",
-    "windows-x86_64": "herdr-windows-x86_64.zip",
 }
 
 

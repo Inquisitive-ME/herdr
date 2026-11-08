@@ -211,15 +211,9 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             name: herdr-linux-aarch64
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: herdr-macos-x86_64
           - target: aarch64-apple-darwin
             os: macos-latest
             name: herdr-macos-aarch64
-          - target: x86_64-pc-windows-msvc
-            os: windows-2022
-            name: herdr-windows-x86_64.zip
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -294,27 +288,9 @@ jobs:
         run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: Package Unix artifact
-        if: runner.os != 'Windows'
+      - name: Package artifact
         shell: bash
         run: cp target/${{ matrix.target }}/release/herdr ${{ matrix.name }}
-      - name: Package Windows artifact with upstream's ConPTY runtime
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $package = Join-Path $env:RUNNER_TEMP "Microsoft.Windows.Console.ConPTY.nupkg"
-          $stage = Join-Path $env:RUNNER_TEMP "herdr-windows-x86_64"
-          .\scripts\package_windows_conpty.ps1 `
-            -HerdrExe target\${{ matrix.target }}\release\herdr.exe `
-            -PackagePath $package `
-            -StageDir $stage `
-            -OutputPath ${{ matrix.name }}
-          $version = (& (Join-Path $stage "herdr.exe") --version | Out-String).Trim()
-          $tagVersion = $env:UPSTREAM_TAG -replace '^v', ''
-          if ($version -notmatch [regex]::Escape($tagVersion) -or $version -match "preview") {
-            throw "Packaged Windows binary has unexpected version identity: $version"
-          }
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -340,7 +316,7 @@ jobs:
           ref: ${{ needs.plan.outputs.upstream_tag }}
           path: upstream
           persist-credentials: false
-      - name: Download all five artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: herdr-*
@@ -360,8 +336,8 @@ jobs:
             --source-dir upstream --assets-dir dist --repo "$GITHUB_REPOSITORY" \
             --release-tag "$RELEASE_TAG" --notes-file dist/RELEASE_NOTES.md --output dist/latest.json
           cd dist
-          sha256sum herdr-linux-x86_64 herdr-linux-aarch64 herdr-macos-x86_64 \
-            herdr-macos-aarch64 herdr-windows-x86_64.zip latest.json > SHA256SUMS
+          sha256sum herdr-linux-x86_64 herdr-linux-aarch64 herdr-macos-aarch64 \
+            latest.json > SHA256SUMS
       - name: Publish stable release as latest
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
@@ -377,8 +353,6 @@ jobs:
           files: |
             dist/herdr-linux-x86_64
             dist/herdr-linux-aarch64
-            dist/herdr-macos-x86_64
             dist/herdr-macos-aarch64
-            dist/herdr-windows-x86_64.zip
             dist/latest.json
             dist/SHA256SUMS
