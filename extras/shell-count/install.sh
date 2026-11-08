@@ -17,9 +17,13 @@ case "$(uname -s)" in
             echo "removed herdr-shell-count"
             exit 0
         fi
+        herdr_path=$(command -v herdr) || { echo "install herdr first" >&2; exit 1; }
         mkdir -p "$(dirname "$bin")" "$(dirname "$unit")"
         install -m 755 "$here/herdr-shell-count.py" "$bin"
-        install -m 644 "$here/herdr-shell-count.service" "$unit"
+        # Only start while herdr exists at the path it's installed at now.
+        sed "s#^ConditionPathExists=.*#ConditionPathExists=$herdr_path#" \
+            "$here/herdr-shell-count.service" > "$unit"
+        chmod 644 "$unit"
         systemctl --user daemon-reload
         systemctl --user enable --now herdr-shell-count.service
         systemctl --user restart herdr-shell-count.service  # pick up a new script on reinstall

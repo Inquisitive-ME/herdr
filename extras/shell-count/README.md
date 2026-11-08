@@ -16,3 +16,8 @@ python3 extras/shell-count/herdr-shell-count.py --once --dry-run  # just print c
 ```
 
 It must run on the machine where the herdr server and agents run.
+
+It never outlives herdr. If herdr is removed, the watcher exits on its next check and
+the service doesn't restart it. On Linux the service also won't start at login while
+herdr is missing. While herdr is installed but not running, it waits quietly and logs
+once. To remove the watcher itself, run `install.sh --uninstall`.

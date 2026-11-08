@@ -9,6 +9,7 @@ token. The patched herdr sidebar shows it as "· 2 shells". Linux and macOS.
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -101,12 +102,20 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="print counts instead of reporting them")
     args = parser.parse_args()
     state = {}  # pane -> (last reported count, when); empty state clears old counts on start
+    last_error = None
     while True:
+        if shutil.which(HERDR) is None:
+            # herdr was uninstalled: exit cleanly so the service doesn't restart us.
+            print("herdr-shell-count: herdr is not installed; exiting", file=sys.stderr, flush=True)
+            return
         try:
             cycle(state, args.min_age, args.dry_run)
             delay = args.interval
+            last_error = None
         except Exception as error:  # herdr not running yet, restarting, etc.
-            print(f"herdr-shell-count: {error}", file=sys.stderr, flush=True)
+            if str(error) != last_error:  # log once per problem, not every retry
+                print(f"herdr-shell-count: {error}", file=sys.stderr, flush=True)
+                last_error = str(error)
             state.clear()
             delay = 10
         if args.once:
