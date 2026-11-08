@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Richard Swanson <rswanson05@gmail.com>
+Date: Sun, 8 Nov 2026 17:14:04 -0600
+Subject: [PATCH] fix: mark a space dropped last under the last box
+
+The drop marker for the slot after the last space sat on the row right
+under that space's name, which is now its first tree line. Record where
+each space's tree ends and put the marker there, on the box's bottom
+edge.
+
+diff --git a/src/client/shell/endpoint_sidebar.rs b/src/client/shell/endpoint_sidebar.rs
+index 6e0bae65..bc193e4f 100644
+--- a/src/client/shell/endpoint_sidebar.rs
++++ b/src/client/shell/endpoint_sidebar.rs
+@@ -587,6 +587,11 @@ pub(super) fn render_expanded(
+                     indented: entry.indented,
+                     group_toggle,
+                 });
++                hits.space_ends.push((
++                    endpoint.endpoint_id.clone(),
++                    workspace.workspace_id.clone(),
++                    inner.bottom(),
++                ));
+                 let gap = gaps
+                     .get(row_index)
+                     .copied()
+diff --git a/src/client/shell/mouse.rs b/src/client/shell/mouse.rs
+index 05d1f8ab..ef077e2d 100644
+--- a/src/client/shell/mouse.rs
++++ b/src/client/shell/mouse.rs
+@@ -572,7 +572,7 @@ impl ClientShellState {
+                     .get(entry.index)
+                     .map(|workspace| workspace.workspace_id.clone())
+             });
+-            let row = last_hit.rect.bottom();
++            let row = self.space_end(last_hit);
+             if row < self.hits.new_workspace.y {
+                 slots.push((before, row));
+             }
+diff --git a/src/client/shell/sidebar.rs b/src/client/shell/sidebar.rs
+index 1c05453f..48a5161a 100644
+--- a/src/client/shell/sidebar.rs
++++ b/src/client/shell/sidebar.rs
+@@ -384,6 +384,11 @@ pub(crate) fn render_sidebar(
+             indented: entry.indented,
+             group_toggle,
+         });
++        hits.space_ends.push((
++            ClientEndpointId::Local,
++            workspace.workspace_id.clone(),
++            inner.bottom(),
++        ));
+         if let Some(summary) = space_agents::render_space_tree(
+             buffer,
+             Rect::new(
+diff --git a/src/client/shell/space_agents.rs b/src/client/shell/space_agents.rs
+index a384b371..74954854 100644
+--- a/src/client/shell/space_agents.rs
++++ b/src/client/shell/space_agents.rs
+@@ -1398,6 +1398,17 @@ impl ClientShellState {
+         }
+     }
+ 
++    /// The row just below a space's tree, where a space dropped after it would go.
++    pub(super) fn space_end(&self, hit: &WorkspaceHit) -> u16 {
++        self.hits
++            .space_ends
++            .iter()
++            .find(|(endpoint_id, workspace_id, _)| {
++                *endpoint_id == hit.endpoint_id && *workspace_id == hit.workspace_id
++            })
++            .map_or(hit.rect.bottom(), |(_, _, row)| *row)
++    }
++
+     /// Dim the dragged line and shade where it would land.
+     pub(super) fn paint_space_line_drag(&self, buffer: &mut Buffer) {
+         let Some(drag) = self.space_tree.drag.as_ref() else {
+diff --git a/src/client/shell/state.rs b/src/client/shell/state.rs
+index d741c4d4..8d97eb91 100644
+--- a/src/client/shell/state.rs
++++ b/src/client/shell/state.rs
+@@ -99,6 +99,8 @@ pub(super) struct ShellHitMap {
+     pub(super) space_toggles: Vec<(Rect, ClientEndpointId, String)>,
+     /// Fork: sidebar rows drawn on a slightly lighter shade (alternate tabs and agents).
+     pub(super) shaded_rows: Vec<Rect>,
++    /// Fork: the row just below each space's tree (its box's bottom edge when boxed).
++    pub(super) space_ends: Vec<(ClientEndpointId, String, u16)>,
+     pub(super) agent_body: Rect,
+     pub(super) agent_scrollbar: Rect,
+     pub(super) agent_scroll_metrics: Option<crate::pane::ScrollMetrics>,
+diff --git a/src/client/shell/tests/space_tree.rs b/src/client/shell/tests/space_tree.rs
+index 3b0a8465..59376859 100644
+--- a/src/client/shell/tests/space_tree.rs
++++ b/src/client/shell/tests/space_tree.rs
+@@ -575,3 +575,31 @@ fn alternate_tabs_are_shaded_and_waiting_agents_numbered_like_the_tree() {
+         .count();
+     assert_eq!(shaded, 1);
+ }
++
++#[test]
++fn a_space_dropped_last_marks_the_bottom_of_the_last_box() {
++    let mut state = tree_state();
++    let first = state.hits.workspaces[0].rect;
++    let last_line = line(&state, "pane_3");
++    let bottom = last_line.bottom();
++    let frame = state.compose(106, 30).expect("frame");
++    assert_eq!(cell(&frame, state.hits.workspace_body.x, bottom), "╰");
++
++    mouse(&mut state, MouseEventKind::Down(MouseButton::Left), first);
++    mouse(
++        &mut state,
++        MouseEventKind::Drag(MouseButton::Left),
++        last_line,
++    );
++    assert!(matches!(
++        state.chrome_drag,
++        Some(ClientChromeDrag::Workspace {
++            target: Some((None, row)),
++            ..
++        }) if row == bottom
++    ));
++    // The marker replaces the box's bottom edge, not the last tab's line.
++    let frame = state.compose(106, 30).expect("frame");
++    assert_eq!(cell(&frame, state.hits.workspace_body.x, bottom), "─");
++    assert_eq!(cell(&frame, last_line.x + 1, last_line.y), "$");
++}

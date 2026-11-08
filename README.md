@@ -29,8 +29,8 @@ The patches in `patches/`:
    pick it up. Older servers just show no ages and refuse cross-space drags.
 6. **Organized space tree.**
    - The ▾ at the right of a space collapses it to one summary row of status
-     counts (`●2 ✓1 ›2`); clicking the summary expands it again.
-   - Plain terminals are listed dimmed (`› backend`). Right-click a space and choose
+     counts (`●2 ✓1 $2`); clicking the summary expands it again.
+   - Plain terminals are listed dimmed (`$ backend`). Right-click a space and choose
      Hide terminals to hide them there.
    - A pane working outside its space's home folder (the first tab's) gets a
      `↳ subdir` line.
@@ -75,6 +75,12 @@ The patches in `patches/`:
     background get no shading). Plain terminals show `$` in the agent-number column so
     their names line up with the agents' (collapsed summaries count them as `$2`).
     Waiting agents show their tree number in the same column.
+15. **Space drop marker.** Dragging a space below the last one marks the bottom edge of
+    the last box instead of that space's first tab line.
+16. **Hover.** The sidebar line under the mouse (a machine, space, tab, collapsed
+    summary or waiting agent) lights up a step brighter than the tab shading. The
+    current tab and space keep their own highlight. Like the shading, it needs a
+    terminal that reports its background.
 
 Builds: Linux x86_64, Linux ARM (aarch64) and Apple Silicon macOS. There are no
 Windows or Intel Mac builds; use upstream herdr there.
@@ -208,6 +214,19 @@ Local manifest and installer tests (Python 3.10+):
 
 ```sh
 python3 -B -m unittest discover -s scripts -p 'test_*.py'
+```
+
+## Sidebar mockups
+
+[`tools/sidebar-mockup`](tools/sidebar-mockup) draws a herdr build's sidebar to a PNG
+the way kitty's Breeze Dark theme shows it, to compare looks before shipping them. It
+runs the binary in a throwaway session with its own config, state and sockets (deleted
+afterwards; a running herdr is not touched) and a made-up layout. Needs `pip install
+pyte pillow`.
+
+```sh
+python3 tools/sidebar-mockup/mockup.py target/debug/herdr out.png --attention --hover deploy
+python3 tools/sidebar-mockup/side_by_side.py both.png before.png before out.png after
 ```
 
 herdr is developed by [herdrdev/herdr](https://github.com/herdrdev/herdr) and
