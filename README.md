@@ -15,6 +15,10 @@ The patches in `patches/`:
    run them.
 2. **Updates from this repo.** `herdr update`, background version checks and
    remote installs read this repository's `latest.json` instead of herdr.dev.
+3. **Shell counts.** Agent lines show `· N shells` when the agent is running shell
+   commands. The count comes from the watcher in
+   [`extras/shell-count`](extras/shell-count), which runs as a user service on the
+   machine where herdr's server runs.
 
 Builds: Linux x86_64, Linux ARM (aarch64) and Apple Silicon macOS. There are no
 Windows or Intel Mac builds; use upstream herdr there.
