@@ -1,0 +1,403 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Richard Swanson <rswanson05@gmail.com>
+Date: Sun, 8 Nov 2026 15:12:59 -0600
+Subject: [PATCH] feat: box each space in the sidebar
+
+Spaces in the spaces list (and each machine's spaces in the multi-machine list) sit in boxes; neighbouring spaces share a border row, and worktree children stay inside their parent's box. Sidebars narrower than 12 columns go without boxes.
+
+diff --git a/src/client/shell/endpoint_sidebar.rs b/src/client/shell/endpoint_sidebar.rs
+index 41706629..035e01d7 100644
+--- a/src/client/shell/endpoint_sidebar.rs
++++ b/src/client/shell/endpoint_sidebar.rs
+@@ -277,11 +277,18 @@ pub(super) fn render_expanded(
+             );
+         }
+     }
++    let boxed = super::space_agents::spaces_boxed(area.width);
+     let row_heights = rows
+         .iter()
+-        .map(|row| match row {
++        .enumerate()
++        .map(|(row_index, row)| match row {
+             Row::Endpoint(_) => 1,
+             Row::Workspace { endpoint, entry } => {
++                // A machine's last space closes its box.
++                let last = !matches!(
++                    rows.get(row_index + 1),
++                    Some(Row::Workspace { endpoint: next, .. }) if next == endpoint
++                );
+                 let endpoint = &state.endpoints[*endpoint];
+                 let collapsed_groups = collapsed_groups_for_endpoint(state, &endpoint.endpoint_id)
+                     .unwrap_or(&empty_collapsed_groups);
+@@ -308,6 +315,11 @@ pub(super) fn render_expanded(
+                                     snapshot,
+                                     &workspace.workspace_id,
+                                     collapsed_groups,
++                                ))
++                                .saturating_add(super::space_agents::space_box_rows(
++                                    boxed,
++                                    entry.indented,
++                                    last,
+                                 )),
+                         )
+                     })
+@@ -411,10 +423,17 @@ pub(super) fn render_expanded(
+         .saturating_sub(metrics.offset_from_bottom);
+     let show_scrollbar = metrics.max_offset_from_bottom > 0 && body.width > 1;
+     let content_width = body.width.saturating_sub(u16::from(show_scrollbar));
++    // Each machine's spaces are boxed, inset under its header; unboxed, they are indented.
++    let mut boxes = if boxed {
++        super::space_agents::SpaceBoxes::new(body.x + 1, content_width.saturating_sub(1), true)
++    } else {
++        super::space_agents::SpaceBoxes::new(body.x + 2, content_width.saturating_sub(2), false)
++    };
+     let mut y = body.y;
+     for (row_index, row) in rows.iter().enumerate().skip(*state.workspace_scroll) {
+         match row {
+             Row::Endpoint(index) => {
++                y = boxes.finish(buffer, y, body.bottom(), palette);
+                 if y >= body.bottom() {
+                     break;
+                 }
+@@ -473,18 +492,19 @@ pub(super) fn render_expanded(
+                     collapsed_groups,
+                 );
+                 let space_height = tokens.len().max(1).min(u16::MAX as usize) as u16;
+-                let entry_height = space_height.saturating_add(tree.height()).min(body.height);
++                let entry_height = boxes
++                    .border_rows(entry.indented)
++                    .saturating_add(space_height)
++                    .saturating_add(tree.height())
++                    .min(body.height);
+                 if y.saturating_add(entry_height) > body.bottom() {
+                     break;
+                 }
+-                let height = space_height.min(entry_height);
+-                let rect = Rect::new(body.x, y, content_width, height);
+-                let nested = Rect::new(
+-                    rect.x.saturating_add(2),
+-                    rect.y,
+-                    rect.width.saturating_sub(2),
+-                    rect.height,
+-                );
++                let content_y = boxes.start(buffer, y, entry.indented, palette);
++                let inner = boxes.inner(buffer, content_y, entry_height - (content_y - y), palette);
++                let height = space_height.min(inner.height);
++                let rect = Rect::new(body.x, content_y, inner.right() - body.x, height);
++                let nested = Rect::new(inner.x, rect.y, inner.width, rect.height);
+                 let endpoint_active = &endpoint.endpoint_id == state.active_endpoint_id;
+                 let selected = state.selected_workspace_id.is_some_and(|target| {
+                     target.matches(&endpoint.endpoint_id, &workspace.workspace_id)
+@@ -503,7 +523,7 @@ pub(super) fn render_expanded(
+                     palette,
+                 );
+                 let agent_area =
+-                    Rect::new(nested.x, rect.bottom(), nested.width, entry_height - height);
++                    Rect::new(nested.x, rect.bottom(), nested.width, inner.height - height);
+                 let summary = super::space_agents::render_space_tree(
+                     buffer,
+                     agent_area,
+@@ -564,12 +584,16 @@ pub(super) fn render_expanded(
+                     indented: entry.indented,
+                     group_toggle,
+                 });
+-                y = y
+-                    .saturating_add(entry_height)
+-                    .saturating_add(gaps.get(row_index).copied().unwrap_or(0));
++                let gap = gaps
++                    .get(row_index)
++                    .copied()
++                    .unwrap_or(0)
++                    .min(body.bottom().saturating_sub(inner.bottom()));
++                y = boxes.inner(buffer, inner.bottom(), gap, palette).bottom();
+             }
+         }
+     }
++    boxes.finish(buffer, y, body.bottom(), palette);
+     if show_scrollbar {
+         let track = Rect::new(body.right().saturating_sub(1), body.y, 1, body.height);
+         hits.workspace_scrollbar = track;
+diff --git a/src/client/shell/sidebar.rs b/src/client/shell/sidebar.rs
+index 21eea77d..096d4017 100644
+--- a/src/client/shell/sidebar.rs
++++ b/src/client/shell/sidebar.rs
+@@ -212,9 +212,11 @@ pub(crate) fn render_sidebar(
+         Rect::new(area.right().saturating_sub(1), area.y, 1, area.height)
+     };
+     let entries = workspace_entries(snapshot, state.collapsed_groups);
++    let boxed = space_agents::spaces_boxed(area.width);
+     let row_heights = entries
+         .iter()
+-        .map(|entry| {
++        .enumerate()
++        .map(|(position, entry)| {
+             snapshot
+                 .workspaces
+                 .get(entry.index)
+@@ -233,6 +235,11 @@ pub(crate) fn render_sidebar(
+                             &workspace.workspace_id,
+                             state.collapsed_groups,
+                         ))
++                        .saturating_add(space_agents::space_box_rows(
++                            boxed,
++                            entry.indented,
++                            position + 1 == entries.len(),
++                        ))
+                 })
+                 .unwrap_or(1)
+         })
+@@ -309,6 +316,7 @@ pub(crate) fn render_sidebar(
+     let content_width = body.width.saturating_sub(u16::from(show_scrollbar));
+     let agent_numbers = space_agents::agent_numbers(snapshot, config);
+     let now_ms = space_agents::now_unix_ms();
++    let mut boxes = space_agents::SpaceBoxes::new(body.x, content_width, boxed);
+     let mut y = body.y;
+     for (entry_position, entry) in entries.iter().enumerate().skip(*state.workspace_scroll) {
+         let Some(workspace) = snapshot.workspaces.get(entry.index) else {
+@@ -319,12 +327,18 @@ pub(crate) fn render_sidebar(
+         let tree =
+             space_agents::space_tree(snapshot, &workspace.workspace_id, state.collapsed_groups);
+         let space_height = rows.len().max(1).min(u16::MAX as usize) as u16;
+-        let entry_height = space_height.saturating_add(tree.height()).min(body.height);
++        let entry_height = boxes
++            .border_rows(entry.indented)
++            .saturating_add(space_height)
++            .saturating_add(tree.height())
++            .min(body.height);
+         if y.saturating_add(entry_height) > body.bottom() {
+             break;
+         }
+-        let row_height = space_height.min(entry_height);
+-        let rect = Rect::new(body.x, y, content_width, row_height);
++        let content_y = boxes.start(buffer, y, entry.indented, palette);
++        let inner = boxes.inner(buffer, content_y, entry_height - (content_y - y), palette);
++        let row_height = space_height.min(inner.height);
++        let rect = Rect::new(inner.x, content_y, inner.width, row_height);
+         let selected = state.selected_workspace_id.is_some_and(|target| {
+             target.matches(state.active_endpoint_id, &workspace.workspace_id)
+         });
+@@ -373,10 +387,10 @@ pub(crate) fn render_sidebar(
+         if let Some(summary) = space_agents::render_space_tree(
+             buffer,
+             Rect::new(
+-                body.x,
++                inner.x,
+                 rect.bottom(),
+-                content_width,
+-                entry_height - row_height,
++                inner.width,
++                inner.height - row_height,
+             ),
+             if entry.indented { 8 } else { 3 },
+             &tree,
+@@ -394,9 +408,11 @@ pub(crate) fn render_sidebar(
+         }
+         let gap = entries
+             .get(entry_position + 1)
+-            .map_or(0, |next| u16::from(!next.indented) * config.spaces.row_gap);
+-        y = y.saturating_add(entry_height + gap);
++            .map_or(0, |next| u16::from(!next.indented) * config.spaces.row_gap)
++            .min(body.bottom().saturating_sub(inner.bottom()));
++        y = boxes.inner(buffer, inner.bottom(), gap, palette).bottom();
+     }
++    boxes.finish(buffer, y, body.bottom(), palette);
+ 
+     if show_scrollbar {
+         let track = Rect::new(body.right().saturating_sub(1), body.y, 1, body.height);
+diff --git a/src/client/shell/space_agents.rs b/src/client/shell/space_agents.rs
+index b92c2c0d..aea11d62 100644
+--- a/src/client/shell/space_agents.rs
++++ b/src/client/shell/space_agents.rs
+@@ -717,6 +717,134 @@ pub(in crate::client::shell) fn render_space_tree(
+     None
+ }
+ 
++/// Narrower sidebars keep their columns for text and go without boxes.
++const MIN_BOXED_SIDEBAR_WIDTH: u16 = 12;
++
++/// Whether a sidebar this wide boxes its spaces.
++pub(in crate::client::shell) fn spaces_boxed(sidebar_width: u16) -> bool {
++    sidebar_width >= MIN_BOXED_SIDEBAR_WIDTH
++}
++
++/// Rows a space's box adds to its list entry: the border above a top-level space, and
++/// the bottom border under the last space of a list.
++pub(in crate::client::shell) fn space_box_rows(boxed: bool, indented: bool, last: bool) -> u16 {
++    if boxed {
++        u16::from(!indented) + u16::from(last)
++    } else {
++        0
++    }
++}
++
++/// Draws a box around each space in the spaces list, top to bottom. Neighbouring spaces
++/// share a border row; a worktree's child spaces sit inside their parent's box.
++pub(in crate::client::shell) struct SpaceBoxes {
++    x: u16,
++    width: u16,
++    boxed: bool,
++    open: bool,
++}
++
++impl SpaceBoxes {
++    /// Boxes spanning columns `x..x + width`; unboxed, spaces use those columns as they are.
++    pub(in crate::client::shell) fn new(x: u16, width: u16, boxed: bool) -> Self {
++        Self {
++            x,
++            width,
++            boxed,
++            open: false,
++        }
++    }
++
++    /// Border rows drawn above the next space.
++    pub(in crate::client::shell) fn border_rows(&self, indented: bool) -> u16 {
++        u16::from(self.boxed && !(indented && self.open))
++    }
++
++    /// Start a space at row `y`, under a `╭─╮` or a shared `├─┤` border unless it
++    /// continues its parent's box. Returns the row its content starts on.
++    pub(in crate::client::shell) fn start(
++        &mut self,
++        buffer: &mut Buffer,
++        y: u16,
++        indented: bool,
++        palette: &Palette,
++    ) -> u16 {
++        if self.border_rows(indented) == 0 {
++            return y;
++        }
++        let corners = if self.open {
++            ("├", "┤")
++        } else {
++            ("╭", "╮")
++        };
++        self.border(buffer, y, corners, palette);
++        self.open = true;
++        y.saturating_add(1)
++    }
++
++    /// Draw the walls beside rows `y..y + height` and return the area between them.
++    pub(in crate::client::shell) fn inner(
++        &self,
++        buffer: &mut Buffer,
++        y: u16,
++        height: u16,
++        palette: &Palette,
++    ) -> Rect {
++        if !self.boxed {
++            return Rect::new(self.x, y, self.width, height);
++        }
++        let style = Style::default().fg(palette.surface1);
++        for row in y..y.saturating_add(height) {
++            put_text(buffer, self.x, row, 1, "│", style);
++            put_text(
++                buffer,
++                self.x + self.width.saturating_sub(1),
++                row,
++                1,
++                "│",
++                style,
++            );
++        }
++        Rect::new(
++            self.x.saturating_add(1),
++            y,
++            self.width.saturating_sub(2),
++            height,
++        )
++    }
++
++    /// Close an open box on row `y` if it is above `bottom`. Returns the next free row.
++    pub(in crate::client::shell) fn finish(
++        &mut self,
++        buffer: &mut Buffer,
++        y: u16,
++        bottom: u16,
++        palette: &Palette,
++    ) -> u16 {
++        if !self.open || y >= bottom {
++            return y;
++        }
++        self.border(buffer, y, ("╰", "╯"), palette);
++        self.open = false;
++        y.saturating_add(1)
++    }
++
++    fn border(&self, buffer: &mut Buffer, y: u16, (left, right): (&str, &str), palette: &Palette) {
++        if self.width < 2 {
++            return;
++        }
++        let line = format!("{left}{}{right}", "─".repeat(usize::from(self.width - 2)));
++        put_text(
++            buffer,
++            self.x,
++            y,
++            self.width,
++            &line,
++            Style::default().fg(palette.surface1),
++        );
++    }
++}
++
+ /// One row standing in for a collapsed tree: a count per agent status, then terminals.
+ fn render_summary(
+     buffer: &mut Buffer,
+diff --git a/src/client/shell/tests/space_tree.rs b/src/client/shell/tests/space_tree.rs
+index 01574926..7786e9a2 100644
+--- a/src/client/shell/tests/space_tree.rs
++++ b/src/client/shell/tests/space_tree.rs
+@@ -459,3 +459,53 @@ fn multi_machine_next_agent_goes_to_the_most_urgent_across_machines() {
+         ]
+     );
+ }
++
++fn cell(frame: &FrameData, x: u16, y: u16) -> &str {
++    &frame.cells[usize::from(y) * usize::from(frame.width) + usize::from(x)].symbol
++}
++
++#[test]
++fn each_space_sits_in_a_box_sharing_borders_with_its_neighbours() {
++    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
++    state.set_snapshot(Box::new(tree_snapshot()));
++    state.set_pane_surface(surface());
++    let frame = state.compose(106, 30).expect("frame");
++    let first = space(&state, "ws_1");
++    let second = space(&state, "ws_2");
++    let deploy = line(&state, "pane_2");
++    let last = line(&state, "pane_3");
++    let edges = |y| (cell(&frame, first.x - 1, y), cell(&frame, first.right(), y));
++    assert_eq!(edges(first.y - 1), ("╭", "╮"));
++    assert_eq!(edges(deploy.y), ("│", "│"));
++    assert_eq!(second.y - 1, deploy.bottom());
++    assert_eq!(edges(second.y - 1), ("├", "┤"));
++    assert_eq!(edges(last.bottom()), ("╰", "╯"));
++}
++
++#[test]
++fn each_machine_closes_its_spaces_box_before_the_next_machine() {
++    let (mut state, remote) = multi_machine_state(AgentStatus::Working);
++    let frame = state.compose(106, 40).expect("frame");
++    let local_last = machine_line(
++        &state,
++        &crate::client::endpoint::ClientEndpointId::Local,
++        "pane_3",
++    );
++    let remote_first = machine_line(&state, &remote, "pane_1");
++    let remote_space = state
++        .hits
++        .workspaces
++        .iter()
++        .find(|hit| hit.endpoint_id == remote && hit.workspace_id == "ws_1")
++        .map(|hit| hit.rect)
++        .expect("remote space");
++    let edges = |line: Rect, y| (cell(&frame, line.x - 1, y), cell(&frame, line.right(), y));
++    assert_eq!(edges(local_last, local_last.bottom()), ("╰", "╯"));
++    assert!(state
++        .hits
++        .machines
++        .iter()
++        .any(|machine| machine.endpoint_id == remote && machine.rect.y == local_last.bottom() + 1));
++    assert_eq!(edges(remote_first, remote_space.y - 1), ("╭", "╮"));
++    assert_eq!(edges(remote_first, remote_first.y), ("│", "│"));
++}

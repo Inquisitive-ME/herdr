@@ -64,6 +64,11 @@ The patches in `patches/`:
     `local_agent_click_can_cancel_a_pending_remote_switch` and
     `switching_machines_preserves_aggregate_agent_scroll_and_visible_rows` expect the
     switch on mouse-down and fail by design.
+13. **A box per space.** Each space and its tree sit in a box; neighbouring spaces
+    share a border row, and in the multi-machine sidebar each machine's spaces are
+    boxed under its name. Sidebars narrower than 12 columns go without. Upstream's
+    `mouse_hits_use_stable_workspace_tab_and_pane_ids` clicks the row that is now the
+    top border and fails by design.
 
 Builds: Linux x86_64, Linux ARM (aarch64) and Apple Silicon macOS. There are no
 Windows or Intel Mac builds; use upstream herdr there.
