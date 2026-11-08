@@ -34,7 +34,8 @@ The patches in `patches/`:
      Hide terminals to hide them there.
    - A pane working outside its space's home folder (the first tab's) gets a
      `↳ subdir` line.
-   - Agent lines show how long they've been in their state (`12m`, `3h`, `2d`).
+   - Working and blocked agents show how long they've been running or waiting
+     (`12m`, `3h`, `2d`).
    - Drag a line onto another space to move it there as a new tab, or onto a line
      in the same space to reorder tabs. Right-click a line to rename its tab, move
      it to another or a new space, or close it. Clicking still jumps to it.
