@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Richard Swanson <rswanson05@gmail.com>
+Date: Sun, 8 Nov 2026 08:15:38 -0600
+Subject: [PATCH] feat: keep turns the server reports unread when a client
+ attaches
+
+A newly attached client used to treat every finished turn as read, so reattaching cleared the finished list. It now trusts the server's done state on attach. Upstream's first_snapshot_establishes_an_idle_baseline_without_server_seen_authority test asserts the old behavior.
+
+diff --git a/src/client/shell/endpoint_agent_state.rs b/src/client/shell/endpoint_agent_state.rs
+index 1ebcd35d..e885e07b 100644
+--- a/src/client/shell/endpoint_agent_state.rs
++++ b/src/client/shell/endpoint_agent_state.rs
+@@ -50,10 +50,20 @@ impl EndpointAgentPresentation {
+             self.acknowledged.clear();
+             self.completed.clear();
+             self.working.clear();
++            // Fork: a finished turn the server still reports unread stays unread when a
++            // client attaches, so reattaching doesn't clear the "finished" list.
+             self.acknowledged.extend(
+                 snapshot
+                     .agents
+                     .iter()
++                    .filter(|agent| agent.agent_status != AgentStatus::Done)
++                    .map(|agent| (agent.pane_id.clone(), agent.state_change_seq)),
++            );
++            self.completed.extend(
++                snapshot
++                    .agents
++                    .iter()
++                    .filter(|agent| agent.agent_status == AgentStatus::Done)
+                     .map(|agent| (agent.pane_id.clone(), agent.state_change_seq)),
+             );
+         }
+diff --git a/src/client/shell/tests/space_tree.rs b/src/client/shell/tests/space_tree.rs
+index 3247f4b9..1ce99fa5 100644
+--- a/src/client/shell/tests/space_tree.rs
++++ b/src/client/shell/tests/space_tree.rs
+@@ -46,7 +46,7 @@ fn tree_snapshot() -> ClientShellSnapshot {
+         focused: pane_id == "pane_1",
+     };
+     snapshot.agents = vec![
+-        agent("pane_1", "tab_1", AgentStatus::Done),
++        agent("pane_1", "tab_1", AgentStatus::Idle),
+         agent("pane_2", "tab_2", AgentStatus::Working),
+     ];
+     snapshot
+@@ -296,3 +296,25 @@ fn waiting_agents_are_grouped_needs_input_then_finished() {
+         "{sidebar:#?}"
+     );
+ }
++
++#[test]
++fn turns_finished_before_attaching_stay_unread() {
++    let mut snapshot = tree_snapshot();
++    snapshot.agents[1].agent_status = AgentStatus::Done;
++    snapshot.agents[1].state_change_seq = 7;
++    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
++    state.set_snapshot(Box::new(snapshot));
++    state.set_pane_surface(surface());
++    let frame = state.compose(106, 30).expect("frame");
++    let sidebar = frame_rows(&frame)
++        .into_iter()
++        .map(|row| {
++            row.chars()
++                .take(24)
++                .collect::<String>()
++                .trim_end()
++                .to_owned()
++        })
++        .collect::<Vec<_>>();
++    assert!(sidebar.iter().any(|row| row == " finished"), "{sidebar:#?}");
++}

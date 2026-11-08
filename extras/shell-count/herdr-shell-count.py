@@ -2,9 +2,15 @@
 """Report how many shell commands each herdr agent is running.
 
 Every few seconds this asks herdr which process each agent pane runs, counts that
-process's direct child shells (Claude Code's Bash calls and background shells) that
-have been alive for a few seconds, and stores the count in the pane's `shells`
-token. The patched herdr sidebar shows it as "· 2 shells". Linux and macOS.
+process's direct child shells that have been alive for a few seconds, and stores the
+count in the pane's `shells` token. The patched herdr sidebar shows it as
+"· 2 shells". Linux and macOS.
+
+The count is meant to match Claude Code's background shells. A Bash call Claude is
+waiting on looks the same from outside, but it always starts during the current
+working turn, so while an agent is working only shells older than the turn count.
+That needs the patched server's `state_since_ms` agent token; without it every
+shell counts.
 """
 import argparse
 import json
@@ -38,7 +44,7 @@ def parse_etime(text):
 
 
 def child_shells(min_age):
-    """{parent pid: number of shell children alive at least min_age seconds}."""
+    """{parent pid: ages in seconds of its shell children alive at least min_age}."""
     out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,etime=,comm="],
                          capture_output=True, text=True, timeout=10, check=True)
     counts = {}
@@ -49,8 +55,9 @@ def child_shells(min_age):
         _, ppid, etime, comm = fields
         name = os.path.basename(comm.strip()).lstrip("-")  # macOS gives paths, login shells "-zsh"
         try:
-            if name in SHELLS and parse_etime(etime) >= min_age:
-                counts[int(ppid)] = counts.get(int(ppid), 0) + 1
+            age = parse_etime(etime)
+            if name in SHELLS and age >= min_age:
+                counts.setdefault(int(ppid), []).append(age)
         except ValueError:
             continue
     return counts
@@ -62,6 +69,19 @@ def agent_pid(agent):
     label = (agent.get("agent") or "").lower()
     match = next((p for p in procs if label and label in (p.get("name") or "").lower()), None)
     return (match or (procs[0] if procs else {})).get("pid")
+
+
+def background_count(agent, ages, now_ms):
+    """Shells that aren't the command a working agent is waiting on."""
+    since = (agent.get("tokens") or {}).get("state_since_ms")
+    if agent.get("agent_status") != "working" or not since:
+        return len(ages)
+    try:
+        turn_seconds = max(0, now_ms - int(since)) / 1000
+    except ValueError:
+        return len(ages)
+    # One second of slack for ps rounding: a call made right as the turn began is foreground.
+    return sum(1 for age in ages if age > turn_seconds + 1)
 
 
 def report(pane_id, count, dry_run):
@@ -84,7 +104,7 @@ def cycle(state, min_age, dry_run):
             pid = agent_pid(agent)
         except Exception:  # pane closed between calls
             continue
-        count = shells.get(pid, 0) if pid else 0
+        count = background_count(agent, shells.get(pid, []), time.time() * 1000) if pid else 0
         last = state.get(pane)
         stale = last is not None and count and now - last[1] >= REFRESH_SECONDS
         if last is None or last[0] != count or stale:

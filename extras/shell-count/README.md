@@ -1,8 +1,12 @@
 # herdr-shell-count
 
-Shows how many shell commands each agent is running in the patched sidebar, e.g.
-`● fridge prod 1 · 2 shells`. That covers Claude Code's background shells plus the
-command it is currently running. Commands younger than 3 seconds (hooks) are ignored.
+Shows how many background shells each agent is running in the patched sidebar, e.g.
+`● fridge prod 1 · 2 shells`, like Claude Code's own shell count. A Bash call Claude is
+waiting on looks the same from outside, but it always starts during the current
+working turn, so while an agent is working only shells older than the turn count; a
+background shell started mid-turn shows up once the turn ends. This uses the patched
+server's `state_since_ms` token; with an unpatched server every running shell counts.
+Commands younger than 3 seconds (hooks) are ignored.
 
 A small watcher runs as a user service. Every 3 seconds it asks herdr which process
 each agent pane runs, counts that process's child shells with `ps`, and stores the

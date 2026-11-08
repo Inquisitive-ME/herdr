@@ -46,6 +46,12 @@ The patches in `patches/`:
    turn you haven't looked at yet under a "finished" heading. Visiting an agent clears
    it. `keys.next_agent` / `previous_agent` cycle the most urgent non-empty group (all
    agents when nobody is waiting).
+8. **Ages only while active.** Only working and blocked agents show a time.
+9. **Unread survives reattach.** Upstream clients treat every turn that finished
+   before they attached as read; this keeps what the server still reports unread, so
+   reattaching doesn't empty the finished list. Upstream's
+   `first_snapshot_establishes_an_idle_baseline_without_server_seen_authority` test
+   asserts the old behavior and fails by design.
 
 Builds: Linux x86_64, Linux ARM (aarch64) and Apple Silicon macOS. There are no
 Windows or Intel Mac builds; use upstream herdr there.
