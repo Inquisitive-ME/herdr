@@ -1,0 +1,519 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Richard Swanson <rswanson05@gmail.com>
+Date: Sun, 8 Nov 2026 15:41:58 -0600
+Subject: [PATCH] feat: shade alternate tabs and number waiting agents
+
+Every other tab of a space, and every other agent in the needs-input and finished groups, is drawn a few percent lighter than the terminal's reported background. Plain terminals show a $ in the agent-number column so their names line up with agents', and waiting agents carry their tree number in the same column.
+
+diff --git a/src/client/shell/agent_sidebar.rs b/src/client/shell/agent_sidebar.rs
+index d1fef727..0c95c800 100644
+--- a/src/client/shell/agent_sidebar.rs
++++ b/src/client/shell/agent_sidebar.rs
+@@ -63,6 +63,7 @@ pub(super) fn render_agent_panel(
+         super::space_agents::attention_entries(agent_rows(snapshot, config, None), |row| {
+             row.status
+         });
++    let numbers = super::space_agents::agent_numbers(snapshot, config);
+     if !render_agent_panel_header(
+         buffer,
+         area,
+@@ -89,8 +90,20 @@ pub(super) fn render_agent_panel(
+             super::space_agents::AttentionEntry::Heading(attention) => {
+                 super::space_agents::render_attention_heading(buffer, rect, *attention, config)
+             }
+-            super::space_agents::AttentionEntry::Agent(row) => {
++            super::space_agents::AttentionEntry::Agent { row, shaded } => {
+                 hits.agents.push((rect, row.pane_id.clone()));
++                if *shaded {
++                    hits.shaded_rows.push(rect);
++                }
++                let rect = super::space_agents::render_attention_number(
++                    buffer,
++                    rect,
++                    3,
++                    (!numbers.is_empty())
++                        .then(|| numbers.iter().position(|pane_id| *pane_id == row.pane_id)),
++                    row.focused,
++                    &config.palette,
++                );
+                 render_agent_row(buffer, rect, row, config);
+             }
+         },
+diff --git a/src/client/shell/composition.rs b/src/client/shell/composition.rs
+index 1d644e48..eb01f081 100644
+--- a/src/client/shell/composition.rs
++++ b/src/client/shell/composition.rs
+@@ -235,6 +235,7 @@ impl ClientShellState {
+                 workspace_drop_indicator_row,
+             },
+         );
++        self.paint_shaded_rows(&mut buffer);
+         self.paint_space_line_drag(&mut buffer);
+         self.hits.panes = surface
+             .panes
+diff --git a/src/client/shell/endpoint_agents.rs b/src/client/shell/endpoint_agents.rs
+index cbca4378..e366d369 100644
+--- a/src/client/shell/endpoint_agents.rs
++++ b/src/client/shell/endpoint_agents.rs
+@@ -58,6 +58,7 @@ pub(super) fn render_expanded(
+         agent_rows(endpoints, active_endpoint_id, config),
+         |row| row.agent.status,
+     );
++    let numbers = super::space_agents::endpoint_agent_numbers(endpoints, config);
+     if !super::agent_sidebar::render_agent_panel_header(
+         buffer,
+         area,
+@@ -83,9 +84,26 @@ pub(super) fn render_expanded(
+                     super::space_agents::render_attention_heading(buffer, rect, *attention, config);
+                     return;
+                 }
+-                super::space_agents::AttentionEntry::Agent(row) => row,
++                super::space_agents::AttentionEntry::Agent { row, shaded } => {
++                    if *shaded {
++                        hits.shaded_rows.push(rect);
++                    }
++                    row
++                }
+             };
+-            super::agent_sidebar::render_agent_row(buffer, rect, &row.agent, config);
++            let row_rect = super::space_agents::render_attention_number(
++                buffer,
++                rect,
++                4,
++                (!numbers.is_empty()).then(|| {
++                    numbers.iter().position(|(endpoint_id, pane_id)| {
++                        *endpoint_id == row.endpoint_id && *pane_id == row.agent.pane_id
++                    })
++                }),
++                row.agent.focused,
++                &config.palette,
++            );
++            super::agent_sidebar::render_agent_row(buffer, row_rect, &row.agent, config);
+             if row.stale {
+                 buffer.set_style(
+                     rect,
+diff --git a/src/client/shell/endpoint_sidebar.rs b/src/client/shell/endpoint_sidebar.rs
+index 035e01d7..6e0bae65 100644
+--- a/src/client/shell/endpoint_sidebar.rs
++++ b/src/client/shell/endpoint_sidebar.rs
+@@ -542,7 +542,10 @@ pub(super) fn render_expanded(
+                             line,
+                             endpoint.endpoint_id.clone(),
+                             item.pane_id.to_owned(),
+-                        ))
++                        ));
++                        if item.shaded {
++                            hits.shaded_rows.push(line);
++                        }
+                     },
+                 );
+                 if endpoint.status != ClientEndpointStatus::Online {
+diff --git a/src/client/shell/sidebar.rs b/src/client/shell/sidebar.rs
+index 096d4017..1c05453f 100644
+--- a/src/client/shell/sidebar.rs
++++ b/src/client/shell/sidebar.rs
+@@ -398,7 +398,12 @@ pub(crate) fn render_sidebar(
+             true,
+             config,
+             now_ms,
+-            |line, item| hits.agents.push((line, item.pane_id.to_owned())),
++            |line, item| {
++                hits.agents.push((line, item.pane_id.to_owned()));
++                if item.shaded {
++                    hits.shaded_rows.push(line);
++                }
++            },
+         ) {
+             hits.space_toggles.push((
+                 summary,
+diff --git a/src/client/shell/space_agents.rs b/src/client/shell/space_agents.rs
+index aea11d62..a384b371 100644
+--- a/src/client/shell/space_agents.rs
++++ b/src/client/shell/space_agents.rs
+@@ -6,6 +6,7 @@
+ use std::collections::HashSet;
+ 
+ use ratatui::{
++    style::Color,
+     text::{Line, Span},
+     widgets::{Paragraph, Widget},
+ };
+@@ -16,6 +17,9 @@ use crate::api::schema::AgentStatus;
+ use crate::protocol::{ClientShellAgent, ClientShellPane, ClientShellTab};
+ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+ 
++/// Marks a plain terminal in the space tree.
++const TERMINAL_GLYPH: &str = "$";
++
+ /// Rows the agent section draws above its list: divider, title, blank line.
+ const NEEDS_INPUT_HEADER_ROWS: u16 = 3;
+ 
+@@ -53,14 +57,15 @@ impl Attention {
+ pub(in crate::client::shell) enum AttentionEntry<T> {
+     /// A blank line, then the group's name.
+     Heading(Attention),
+-    Agent(T),
++    /// Every other agent of a group is `shaded`, starting unshaded.
++    Agent { row: T, shaded: bool },
+ }
+ 
+ impl<T> AttentionEntry<T> {
+     pub(in crate::client::shell) fn lines(&self, agent_lines: impl Fn(&T) -> usize) -> usize {
+         match self {
+             Self::Heading(_) => 2,
+-            Self::Agent(row) => agent_lines(row),
++            Self::Agent { row, .. } => agent_lines(row),
+         }
+     }
+ }
+@@ -83,17 +88,51 @@ pub(in crate::client::shell) fn attention_entries<T>(
+         });
+     let mut entries = Vec::with_capacity(grouped.len() + 1);
+     let mut previous = None;
++    let mut shaded = false;
+     for (attention, row) in grouped {
+         if previous.is_some_and(|previous| previous != attention) {
+             entries.push(AttentionEntry::Heading(attention));
++            shaded = false;
+         }
+         previous = Some(attention);
+-        entries.push(AttentionEntry::Agent(row));
++        entries.push(AttentionEntry::Agent { row, shaded });
++        shaded = !shaded;
+     }
+     (title, entries)
+ }
+ 
+ /// Draw a group heading on the second line of its two-line entry.
++/// Make room left of an attention row for the agent's number from the space tree, in
++/// the same column, and return the rest for the row. `number` is `None` when agents
++/// aren't numbered (the row keeps its usual place) and `Some(None)` for an agent past 9.
++pub(in crate::client::shell) fn render_attention_number(
++    buffer: &mut Buffer,
++    rect: Rect,
++    gutter: u16,
++    number: Option<Option<usize>>,
++    focused: bool,
++    palette: &Palette,
++) -> Rect {
++    let Some(number) = number.filter(|_| rect.width > gutter) else {
++        return rect;
++    };
++    let margin = Rect::new(rect.x, rect.y, gutter, rect.height);
++    if focused {
++        buffer.set_style(margin, Style::default().bg(palette.active_row_bg));
++    }
++    if let Some(index) = number {
++        put_text(
++            buffer,
++            rect.x + gutter - 1,
++            rect.y,
++            1,
++            &(index + 1).to_string(),
++            Style::default().fg(palette.overlay0),
++        );
++    }
++    Rect::new(rect.x + gutter, rect.y, rect.width - gutter, rect.height)
++}
++
+ pub(in crate::client::shell) fn render_attention_heading(
+     buffer: &mut Buffer,
+     rect: Rect,
+@@ -155,6 +194,8 @@ pub(in crate::client::shell) struct SpaceItem<'a> {
+     focused: bool,
+     /// Where the pane works, when that isn't the space's home directory.
+     place: Option<String>,
++    /// Every other tab of a space is shaded, starting unshaded.
++    pub(in crate::client::shell) shaded: bool,
+ }
+ 
+ impl SpaceItem<'_> {
+@@ -215,8 +256,12 @@ pub(in crate::client::shell) fn space_tree<'a>(
+         .iter()
+         .find_map(|tab| panes.iter().find(|pane| pane.tab_id == tab.tab_id))
+         .and_then(|pane| pane_dir(pane));
+-    let mut items = Vec::new();
++    let mut items: Vec<SpaceItem<'_>> = Vec::new();
++    // Tabs listed so far; a tab whose panes are all hidden doesn't count.
++    let mut listed_tabs = 0usize;
+     for tab in &tabs {
++        let shaded = listed_tabs % 2 == 1;
++        let listed_before = items.len();
+         let tab_panes = panes
+             .iter()
+             .filter(|pane| pane.tab_id == tab.tab_id)
+@@ -251,8 +296,10 @@ pub(in crate::client::shell) fn space_tree<'a>(
+                 label,
+                 focused: pane.focused,
+                 place,
++                shaded,
+             });
+         }
++        listed_tabs += usize::from(items.len() > listed_before);
+     }
+     // Never hide an agent the pane list doesn't cover.
+     let unlisted = snapshot
+@@ -270,7 +317,9 @@ pub(in crate::client::shell) fn space_tree<'a>(
+             label: agent_label(snapshot, agent).to_owned(),
+             focused: agent.focused,
+             place: None,
++            shaded: listed_tabs % 2 == 1,
+         });
++        listed_tabs += 1;
+     }
+     SpaceTree {
+         workspace_id,
+@@ -681,8 +730,24 @@ pub(in crate::client::shell) fn render_space_tree(
+                 } else {
+                     Style::default().fg(palette.overlay0)
+                 };
++                // A shell prompt where agents show their number, so terminal names line
++                // up with agent names instead of hanging under the agent above.
++                let in_gutter = indent >= 2;
++                if in_gutter {
++                    put_text(
++                        buffer,
++                        x - 2,
++                        y,
++                        1,
++                        TERMINAL_GLYPH,
++                        Style::default().fg(palette.overlay0),
++                    );
++                }
+                 vec![
+-                    Span::styled("›", Style::default().fg(palette.overlay0)),
++                    Span::styled(
++                        if in_gutter { " " } else { TERMINAL_GLYPH },
++                        Style::default().fg(palette.overlay0),
++                    ),
+                     Span::raw(" "),
+                     Span::styled(
+                         crate::ui::truncate_end(&item.label, width.saturating_sub(2)),
+@@ -725,6 +790,31 @@ pub(in crate::client::shell) fn spaces_boxed(sidebar_width: u16) -> bool {
+     sidebar_width >= MIN_BOXED_SIDEBAR_WIDTH
+ }
+ 
++/// The shade for every other tab: the sidebar background moved slightly toward the
++/// text colour. Uses the configured sidebar colour, else the terminal's reported one.
++fn tab_band_color(
++    sidebar_bg: Color,
++    host_background: Option<crate::terminal_theme::RgbColor>,
++) -> Option<Color> {
++    let (r, g, b) = match sidebar_bg {
++        Color::Rgb(r, g, b) => (r, g, b),
++        _ => {
++            let host = host_background?;
++            (host.r, host.g, host.b)
++        }
++    };
++    let dark = u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114 < 128_000;
++    let toward = if dark { 255 } else { 0 };
++    let mix = |channel: u8| {
++        let channel = i32::from(channel);
++        (channel + (toward - channel) * TAB_BAND_PERCENT / 100) as u8
++    };
++    Some(Color::Rgb(mix(r), mix(g), mix(b)))
++}
++
++/// How far the tab shade moves from the background toward the text colour.
++const TAB_BAND_PERCENT: i32 = 6;
++
+ /// Rows a space's box adds to its list entry: the border above a top-level space, and
+ /// the bottom border under the last space of a list.
+ pub(in crate::client::shell) fn space_box_rows(boxed: bool, indented: bool, last: bool) -> u16 {
+@@ -884,7 +974,7 @@ fn render_summary(
+         .count();
+     if terminals > 0 {
+         spans.push(Span::styled(
+-            format!("›{terminals}"),
++            format!("{TERMINAL_GLYPH}{terminals}"),
+             Style::default().fg(palette.overlay0),
+         ));
+     }
+@@ -1288,6 +1378,26 @@ impl ClientShellState {
+         }))
+     }
+ 
++    /// Shade the rows the sidebar marked (every other tab of a space, every other
++    /// waiting agent) a little lighter than the background. Only plain cells change, so
++    /// focus and selection highlights stay. Needs the real background colour: a terminal
++    /// that doesn't report it gets no shading.
++    pub(super) fn paint_shaded_rows(&self, buffer: &mut Buffer) {
++        let plain = self.config.palette.sidebar_bg;
++        let Some(shade) = tab_band_color(plain, self.host_background) else {
++            return;
++        };
++        for rect in &self.hits.shaded_rows {
++            for y in rect.y..rect.bottom() {
++                for x in rect.x..rect.right() {
++                    if let Some(cell) = buffer.cell_mut((x, y)).filter(|cell| cell.bg == plain) {
++                        cell.set_bg(shade);
++                    }
++                }
++            }
++        }
++    }
++
+     /// Dim the dragged line and shade where it would land.
+     pub(super) fn paint_space_line_drag(&self, buffer: &mut Buffer) {
+         let Some(drag) = self.space_tree.drag.as_ref() else {
+@@ -1443,7 +1553,7 @@ mod tests {
+             .iter()
+             .map(|entry| match entry {
+                 AttentionEntry::Heading(attention) => attention.title(),
+-                AttentionEntry::Agent((name, _)) => name,
++                AttentionEntry::Agent { row: (name, _), .. } => name,
+             })
+             .collect()
+     }
+@@ -1460,6 +1570,15 @@ mod tests {
+         let (title, entries) = attention_entries(rows.clone(), |row| row.1);
+         assert_eq!(title, " needs input");
+         assert_eq!(entry_names(&entries), ["b", "e", " finished", "a", "d"]);
++        // Every other agent is shaded, starting over in each group.
++        let shades = entries
++            .iter()
++            .filter_map(|entry| match entry {
++                AttentionEntry::Agent { shaded, .. } => Some(*shaded),
++                AttentionEntry::Heading(_) => None,
++            })
++            .collect::<Vec<_>>();
++        assert_eq!(shades, [false, true, false, true]);
+         // Two two-line agents, the two-line heading and two one-line agents.
+         assert_eq!(
+             attention_list_height(
+@@ -1651,6 +1770,47 @@ mod tests {
+             .collect()
+     }
+ 
++    #[test]
++    fn every_other_listed_tab_is_shaded_and_split_panes_share_it() {
++        let mut snapshot = fridge();
++        snapshot.panes.insert(2, pane("p2b", "ws_1", "t2", "/repo"));
++        snapshot.tabs.insert(4, tab("t6", "ws_1", Some("lidar")));
++        snapshot.panes.push(pane("p6", "ws_1", "t6", "/repo"));
++        snapshot
++            .agents
++            .push(agent("p6", "ws_1", "t6", AgentStatus::Idle));
++        let shades = |tree: &SpaceTree<'_>| {
++            tree.items
++                .iter()
++                .map(|item| (item.pane_id.to_owned(), item.shaded))
++                .collect::<Vec<_>>()
++        };
++        let expect = |rows: &[(&str, bool)]| {
++            rows.iter()
++                .map(|(pane, shaded)| ((*pane).to_owned(), *shaded))
++                .collect::<Vec<_>>()
++        };
++        let tree = space_tree(&snapshot, "ws_1", &HashSet::new());
++        assert_eq!(
++            shades(&tree),
++            expect(&[
++                ("p1", false),
++                ("p2", true),
++                ("p2b", true),
++                ("p3", false),
++                ("p4", true),
++                ("p6", false),
++            ])
++        );
++        // Tabs whose terminals are hidden don't count.
++        let hidden = HashSet::from([terminals_hidden_key("ws_1")]);
++        let tree = space_tree(&snapshot, "ws_1", &hidden);
++        assert_eq!(
++            shades(&tree),
++            expect(&[("p1", false), ("p2", true), ("p6", false)])
++        );
++    }
++
+     #[test]
+     fn space_tree_lists_tabs_in_order_with_terminals_and_places() {
+         let snapshot = fridge();
+diff --git a/src/client/shell/state.rs b/src/client/shell/state.rs
+index a52bca6d..d741c4d4 100644
+--- a/src/client/shell/state.rs
++++ b/src/client/shell/state.rs
+@@ -97,6 +97,8 @@ pub(super) struct ShellHitMap {
+     pub(super) endpoint_agents: Vec<(Rect, ClientEndpointId, String)>,
+     /// Fork: toggles that collapse a space's tree, with the collapsed-group key they flip.
+     pub(super) space_toggles: Vec<(Rect, ClientEndpointId, String)>,
++    /// Fork: sidebar rows drawn on a slightly lighter shade (alternate tabs and agents).
++    pub(super) shaded_rows: Vec<Rect>,
+     pub(super) agent_body: Rect,
+     pub(super) agent_scrollbar: Rect,
+     pub(super) agent_scroll_metrics: Option<crate::pane::ScrollMetrics>,
+diff --git a/src/client/shell/tests/space_tree.rs b/src/client/shell/tests/space_tree.rs
+index 7786e9a2..3b0a8465 100644
+--- a/src/client/shell/tests/space_tree.rs
++++ b/src/client/shell/tests/space_tree.rs
+@@ -509,3 +509,69 @@ fn each_machine_closes_its_spaces_box_before_the_next_machine() {
+     assert_eq!(edges(remote_first, remote_space.y - 1), ("╭", "╮"));
+     assert_eq!(edges(remote_first, remote_first.y), ("│", "│"));
+ }
++
++#[test]
++fn alternate_tabs_are_shaded_and_waiting_agents_numbered_like_the_tree() {
++    let mut config = Config::default();
++    config.keys.focus_agent = crate::config::BindingConfig::one("ctrl+alt+1");
++    let mut snapshot = tree_snapshot();
++    snapshot.agents[0].agent_status = AgentStatus::Blocked;
++    snapshot.agents[1].agent_status = AgentStatus::Blocked;
++    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
++    state.set_snapshot(Box::new(snapshot));
++    state.set_pane_surface(surface());
++    let plain = state.config.palette.sidebar_bg;
++    let tree_line = |state: &ClientShellState, pane_id: &str| {
++        state
++            .hits
++            .agents
++            .iter()
++            .find(|(rect, id)| id == pane_id && rect.y < state.hits.agent_body.y)
++            .map(|(rect, _)| *rect)
++            .expect("tree line")
++    };
++    let waiting = |state: &ClientShellState, pane_id: &str| {
++        state
++            .hits
++            .agents
++            .iter()
++            .find(|(rect, id)| id == pane_id && rect.y >= state.hits.agent_body.y)
++            .map(|(rect, _)| *rect)
++            .expect("waiting row")
++    };
++    let bg =
++        |frame: &FrameData, x: u16, y: u16| frame.to_ratatui_buffer().expect("buffer")[(x, y)].bg;
++
++    // Without the terminal's background colour there is nothing to shade from.
++    let frame = state.compose(106, 30).expect("frame");
++    let deploy = tree_line(&state, "pane_2");
++    assert_eq!(bg(&frame, deploy.right() - 1, deploy.y), plain);
++
++    state.host_background = Some(crate::terminal_theme::RgbColor {
++        r: 0x23,
++        g: 0x26,
++        b: 0x27,
++    });
++    let frame = state.compose(106, 30).expect("frame");
++    let shade = ratatui::style::Color::Rgb(48, 51, 51);
++    // ws_1's second tab is shaded; ws_2's first tab (a terminal) starts over.
++    let deploy = tree_line(&state, "pane_2");
++    let server = tree_line(&state, "pane_3");
++    assert_eq!(bg(&frame, deploy.right() - 1, deploy.y), shade);
++    assert_eq!(bg(&frame, server.right() - 1, server.y), plain);
++    // The terminal's prompt sits where agents show their number.
++    assert_eq!(cell(&frame, deploy.x + 1, deploy.y), "2");
++    assert_eq!(cell(&frame, server.x + 1, server.y), "$");
++
++    // Waiting agents carry their tree number in the same column; one of the two is shaded.
++    let first = waiting(&state, "pane_1");
++    let second = waiting(&state, "pane_2");
++    assert_eq!(cell(&frame, first.x + 2, first.y), "1");
++    assert_eq!(cell(&frame, second.x + 2, second.y), "2");
++    assert_eq!(first.x + 2, deploy.x + 1);
++    let shaded = [first, second]
++        .iter()
++        .filter(|rect| bg(&frame, rect.right() - 1, rect.y) == shade)
++        .count();
++    assert_eq!(shaded, 1);
++}

@@ -69,6 +69,12 @@ The patches in `patches/`:
     boxed under its name. Sidebars narrower than 12 columns go without. Upstream's
     `mouse_hits_use_stable_workspace_tab_and_pane_ids` clicks the row that is now the
     top border and fails by design.
+14. **Shaded tabs, numbered waiting agents.** Every other tab in a space, and every
+    other agent in the needs-input and finished groups, is shaded a few percent
+    lighter than the terminal's background (terminals that don't report their
+    background get no shading). Plain terminals show `$` in the agent-number column so
+    their names line up with the agents' (collapsed summaries count them as `$2`).
+    Waiting agents show their tree number in the same column.
 
 Builds: Linux x86_64, Linux ARM (aarch64) and Apple Silicon macOS. There are no
 Windows or Intel Mac builds; use upstream herdr there.
