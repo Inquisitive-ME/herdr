@@ -67,7 +67,14 @@ def agent_pid(agent):
     info = herdr_json("pane", "process-info", "--pane", agent["pane_id"])["process_info"]
     procs = info.get("foreground_processes") or []
     label = (agent.get("agent") or "").lower()
-    match = next((p for p in procs if label and label in (p.get("name") or "").lower()), None)
+
+    def names(proc):
+        # On macOS Claude Code renames its process to its version ("2.1.318"); argv0
+        # still says "claude".
+        return ((proc.get("name") or "").lower(),
+                os.path.basename(proc.get("argv0") or "").lower())
+
+    match = next((p for p in procs if label and any(label in n for n in names(p))), None)
     return (match or (procs[0] if procs else {})).get("pid")
 
 
