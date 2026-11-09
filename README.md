@@ -25,8 +25,6 @@ The patches in `patches/`:
      a user service on the machine where herdr's server runs.
    - Plain terminals are listed dimmed (`$ backend`). Right-click a space and choose
      Hide terminals to hide them there.
-   - A pane working outside its space's home folder (the first tab's) gets a
-     `↳ subdir` line.
    - The ▾ at the right of a space collapses it to one summary row of status counts
      (`●2 ✓1 $2`); clicking the summary expands it again.
    - Drag a line onto another space to move it there as a new tab, or onto a line in

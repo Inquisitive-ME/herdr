@@ -381,7 +381,7 @@ index 21eea77d..48a5161a 100644
      if show_scrollbar {
          let track = Rect::new(body.right().saturating_sub(1), body.y, 1, body.height);
 diff --git a/src/client/shell/space_agents.rs b/src/client/shell/space_agents.rs
-index b92c2c0d..fca32901 100644
+index a06c9a7d..2f8c75c1 100644
 --- a/src/client/shell/space_agents.rs
 +++ b/src/client/shell/space_agents.rs
 @@ -6,8 +6,9 @@
@@ -476,19 +476,19 @@ index b92c2c0d..fca32901 100644
  pub(in crate::client::shell) fn render_attention_heading(
      buffer: &mut Buffer,
      rect: Rect,
-@@ -155,6 +194,8 @@ pub(in crate::client::shell) struct SpaceItem<'a> {
+@@ -153,6 +192,8 @@ pub(in crate::client::shell) struct SpaceItem<'a> {
+     pub(in crate::client::shell) kind: SpaceItemKind<'a>,
+     label: String,
      focused: bool,
-     /// Where the pane works, when that isn't the space's home directory.
-     place: Option<String>,
 +    /// Every other tab of a space is shaded, starting unshaded.
 +    pub(in crate::client::shell) shaded: bool,
  }
  
  impl SpaceItem<'_> {
-@@ -215,8 +256,12 @@ pub(in crate::client::shell) fn space_tree<'a>(
+@@ -202,8 +243,12 @@ pub(in crate::client::shell) fn space_tree<'a>(
          .iter()
-         .find_map(|tab| panes.iter().find(|pane| pane.tab_id == tab.tab_id))
-         .and_then(|pane| pane_dir(pane));
+         .filter(|pane| pane.workspace_id == workspace_id)
+         .collect::<Vec<_>>();
 -    let mut items = Vec::new();
 +    let mut items: Vec<SpaceItem<'_>> = Vec::new();
 +    // Tabs listed so far; a tab whose panes are all hidden doesn't count.
@@ -499,10 +499,10 @@ index b92c2c0d..fca32901 100644
          let tab_panes = panes
              .iter()
              .filter(|pane| pane.tab_id == tab.tab_id)
-@@ -251,8 +296,10 @@ pub(in crate::client::shell) fn space_tree<'a>(
+@@ -226,8 +271,10 @@ pub(in crate::client::shell) fn space_tree<'a>(
+                 kind,
                  label,
                  focused: pane.focused,
-                 place,
 +                shaded,
              });
          }
@@ -510,41 +510,58 @@ index b92c2c0d..fca32901 100644
      }
      // Never hide an agent the pane list doesn't cover.
      let unlisted = snapshot
-@@ -270,7 +317,9 @@ pub(in crate::client::shell) fn space_tree<'a>(
+@@ -244,7 +291,9 @@ pub(in crate::client::shell) fn space_tree<'a>(
+             kind: SpaceItemKind::Agent(agent),
              label: agent_label(snapshot, agent).to_owned(),
              focused: agent.focused,
-             place: None,
 +            shaded: listed_tabs % 2 == 1,
          });
 +        listed_tabs += 1;
      }
      SpaceTree {
          workspace_id,
-@@ -459,15 +508,20 @@ fn place_text(dir: &str, home: &str) -> Option<String> {
-     {
-         return Some(inside.to_owned());
-     }
-+    Some(home_short(dir))
-+}
-+
-+/// `dir` with a home folder shortened to `~`.
-+fn home_short(dir: &str) -> String {
-     for users in ["/home/", "/Users/"] {
-         if let Some(rest) = dir.strip_prefix(users) {
--            return Some(match rest.split_once('/') {
-+            return match rest.split_once('/') {
-                 Some((_, below)) => format!("~/{below}"),
-                 None => "~".to_owned(),
--            });
-+            };
-         }
-     }
--    Some(dir.to_owned())
-+    dir.to_owned()
+@@ -420,6 +469,40 @@ fn pane_dir(pane: &ClientShellPane) -> Option<&str> {
+         .filter(|dir| !dir.is_empty())
  }
  
- /// Keep the end of `text`, which holds the most specific part of a path.
-@@ -681,8 +735,24 @@ pub(in crate::client::shell) fn render_space_tree(
++/// `dir` with a home folder shortened to `~`.
++fn home_short(dir: &str) -> String {
++    for users in ["/home/", "/Users/"] {
++        if let Some(rest) = dir.strip_prefix(users) {
++            return match rest.split_once('/') {
++                Some((_, below)) => format!("~/{below}"),
++                None => "~".to_owned(),
++            };
++        }
++    }
++    dir.to_owned()
++}
++
++/// Keep the end of `text`, which holds the most specific part of a path.
++fn truncate_start(text: &str, max_width: usize) -> String {
++    if UnicodeWidthStr::width(text) <= max_width {
++        return text.to_owned();
++    }
++    if max_width == 0 {
++        return String::new();
++    }
++    let mut kept = Vec::new();
++    let mut width = 1; // the ellipsis
++    for character in text.chars().rev() {
++        let character_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
++        if width + character_width > max_width {
++            break;
++        }
++        width += character_width;
++        kept.push(character);
++    }
++    std::iter::once('…').chain(kept.into_iter().rev()).collect()
++}
++
+ /// "2 shells" from the `shells` pane token, which the herdr-shell-count watcher reports
+ /// with the number of shell commands the agent process is running.
+ fn shell_count_text(agent: &ClientShellAgent) -> Option<String> {
+@@ -610,8 +693,24 @@ pub(in crate::client::shell) fn render_space_tree(
                  } else {
                      Style::default().fg(palette.overlay0)
                  };
@@ -570,7 +587,7 @@ index b92c2c0d..fca32901 100644
                      Span::raw(" "),
                      Span::styled(
                          crate::ui::truncate_end(&item.label, width.saturating_sub(2)),
-@@ -717,6 +787,165 @@ pub(in crate::client::shell) fn render_space_tree(
+@@ -634,6 +733,165 @@ pub(in crate::client::shell) fn render_space_tree(
      None
  }
  
@@ -736,7 +753,7 @@ index b92c2c0d..fca32901 100644
  /// One row standing in for a collapsed tree: a count per agent status, then terminals.
  fn render_summary(
      buffer: &mut Buffer,
-@@ -756,7 +985,7 @@ fn render_summary(
+@@ -673,7 +931,7 @@ fn render_summary(
          .count();
      if terminals > 0 {
          spans.push(Span::styled(
@@ -745,7 +762,7 @@ index b92c2c0d..fca32901 100644
              Style::default().fg(palette.overlay0),
          ));
      }
-@@ -903,6 +1132,8 @@ pub(in crate::client::shell) struct SpaceTreeState {
+@@ -820,6 +1078,8 @@ pub(in crate::client::shell) struct SpaceTreeState {
      drag: Option<LineDrag>,
      /// Summary of the age labels last drawn, to repaint only when one changes.
      age_marker: u64,
@@ -754,7 +771,7 @@ index b92c2c0d..fca32901 100644
  }
  
  struct LinePress {
-@@ -1160,6 +1391,207 @@ impl ClientShellState {
+@@ -1077,6 +1337,207 @@ impl ClientShellState {
          }))
      }
  
@@ -962,7 +979,7 @@ index b92c2c0d..fca32901 100644
      /// Dim the dragged line and shade where it would land.
      pub(super) fn paint_space_line_drag(&self, buffer: &mut Buffer) {
          let Some(drag) = self.space_tree.drag.as_ref() else {
-@@ -1315,7 +1747,7 @@ mod tests {
+@@ -1232,7 +1693,7 @@ mod tests {
              .iter()
              .map(|entry| match entry {
                  AttentionEntry::Heading(attention) => attention.title(),
@@ -971,7 +988,7 @@ index b92c2c0d..fca32901 100644
              })
              .collect()
      }
-@@ -1332,6 +1764,15 @@ mod tests {
+@@ -1249,6 +1710,15 @@ mod tests {
          let (title, entries) = attention_entries(rows.clone(), |row| row.1);
          assert_eq!(title, " needs input");
          assert_eq!(entry_names(&entries), ["b", "e", " finished", "a", "d"]);
@@ -987,7 +1004,7 @@ index b92c2c0d..fca32901 100644
          // Two two-line agents, the two-line heading and two one-line agents.
          assert_eq!(
              attention_list_height(
-@@ -1523,6 +1964,47 @@ mod tests {
+@@ -1434,6 +1904,47 @@ mod tests {
              .collect()
      }
  
@@ -1033,8 +1050,30 @@ index b92c2c0d..fca32901 100644
 +    }
 +
      #[test]
-     fn space_tree_lists_tabs_in_order_with_terminals_and_places() {
+     fn space_tree_lists_tabs_in_order_with_terminals_one_line_each() {
          let snapshot = fridge();
+@@ -1497,6 +2008,21 @@ mod tests {
+         assert_eq!(agent_cycle(&snapshot), ["p1", "p2", "p5"]);
+     }
+ 
++    #[test]
++    fn home_folders_are_shortened_to_a_tilde() {
++        assert_eq!(home_short("/repository"), "/repository");
++        assert_eq!(home_short("/home/me"), "~");
++        assert_eq!(home_short("/home/me/x/y"), "~/x/y");
++        assert_eq!(home_short("/Users/me/x"), "~/x");
++    }
++
++    #[test]
++    fn truncate_start_keeps_the_end() {
++        assert_eq!(truncate_start("abc", 3), "abc");
++        assert_eq!(truncate_start("~/workspace/polymarket", 12), "…/polymarket");
++        assert_eq!(truncate_start("abc", 0), "");
++    }
++
+     #[test]
+     fn state_age_counts_whole_minutes_hours_and_days() {
+         let since = 1_000_000_000_000u64;
 diff --git a/src/client/shell/state.rs b/src/client/shell/state.rs
 index a52bca6d..8d97eb91 100644
 --- a/src/client/shell/state.rs

@@ -839,10 +839,10 @@ index 46c3a1a0..21eea77d 100644
      if show_scrollbar {
 diff --git a/src/client/shell/space_agents.rs b/src/client/shell/space_agents.rs
 new file mode 100644
-index 00000000..b92c2c0d
+index 00000000..a06c9a7d
 --- /dev/null
 +++ b/src/client/shell/space_agents.rs
-@@ -0,0 +1,1663 @@
+@@ -0,0 +1,1552 @@
 +//! Fork addition: the expanded sidebar lists each space's agents and terminals under it
 +//! as a tree, and the agent section only shows agents that need input.
 +//!
@@ -998,15 +998,9 @@ index 00000000..b92c2c0d
 +    pub(in crate::client::shell) kind: SpaceItemKind<'a>,
 +    label: String,
 +    focused: bool,
-+    /// Where the pane works, when that isn't the space's home directory.
-+    place: Option<String>,
 +}
 +
 +impl SpaceItem<'_> {
-+    fn height(&self) -> u16 {
-+        1 + u16::from(self.place.is_some())
-+    }
-+
 +    pub(in crate::client::shell) fn agent(&self) -> Option<&ClientShellAgent> {
 +        match self.kind {
 +            SpaceItemKind::Agent(agent) => Some(agent),
@@ -1030,9 +1024,7 @@ index 00000000..b92c2c0d
 +        } else if self.collapsed {
 +            1
 +        } else {
-+            self.items
-+                .iter()
-+                .fold(0u16, |total, item| total.saturating_add(item.height()))
++            u16::try_from(self.items.len()).unwrap_or(u16::MAX)
 +        }
 +    }
 +}
@@ -1055,11 +1047,6 @@ index 00000000..b92c2c0d
 +        .iter()
 +        .filter(|pane| pane.workspace_id == workspace_id)
 +        .collect::<Vec<_>>();
-+    // The space's home is where its first tab works.
-+    let home = tabs
-+        .iter()
-+        .find_map(|tab| panes.iter().find(|pane| pane.tab_id == tab.tab_id))
-+        .and_then(|pane| pane_dir(pane));
 +    let mut items = Vec::new();
 +    for tab in &tabs {
 +        let tab_panes = panes
@@ -1071,31 +1058,19 @@ index 00000000..b92c2c0d
 +                .agents
 +                .iter()
 +                .find(|agent| agent.pane_id == pane.pane_id);
-+            let (kind, label, named_by_dir) = match agent {
++            let (kind, label) = match agent {
 +                Some(agent) => (
 +                    SpaceItemKind::Agent(agent),
 +                    agent_label(snapshot, agent).to_owned(),
-+                    false,
 +                ),
-+                None if show_terminals => {
-+                    let (label, named_by_dir) = terminal_label(tab, pane);
-+                    (SpaceItemKind::Terminal, label, named_by_dir)
-+                }
++                None if show_terminals => (SpaceItemKind::Terminal, terminal_label(tab, pane)),
 +                None => continue,
 +            };
-+            let place = (!named_by_dir)
-+                .then(|| {
-+                    pane_dir(pane)
-+                        .zip(home)
-+                        .and_then(|(dir, home)| place_text(dir, home))
-+                })
-+                .flatten();
 +            items.push(SpaceItem {
 +                pane_id: &pane.pane_id,
 +                kind,
 +                label,
 +                focused: pane.focused,
-+                place,
 +            });
 +        }
 +    }
@@ -1114,7 +1089,6 @@ index 00000000..b92c2c0d
 +            kind: SpaceItemKind::Agent(agent),
 +            label: agent_label(snapshot, agent).to_owned(),
 +            focused: agent.focused,
-+            place: None,
 +        });
 +    }
 +    SpaceTree {
@@ -1269,17 +1243,17 @@ index 00000000..b92c2c0d
 +        .unwrap_or(agent.pane_id.as_str())
 +}
 +
-+/// A terminal's pane or tab name, else the folder it's in. The flag says it's the folder.
-+fn terminal_label(tab: &ClientShellTab, pane: &ClientShellPane) -> (String, bool) {
++/// A terminal's pane or tab name, else the folder it's in.
++fn terminal_label(tab: &ClientShellTab, pane: &ClientShellPane) -> String {
 +    if let Some(label) = pane.label.as_deref().filter(|label| !label.is_empty()) {
-+        return (label.to_owned(), false);
++        return label.to_owned();
 +    }
 +    if tab.custom_label {
-+        return (tab.label.clone(), false);
++        return tab.label.clone();
 +    }
 +    match pane_dir(pane).and_then(|dir| dir.trim_end_matches('/').rsplit('/').next()) {
-+        Some(name) if !name.is_empty() => (name.to_owned(), true),
-+        _ => ("shell".to_owned(), false),
++        Some(name) if !name.is_empty() => name.to_owned(),
++        _ => "shell".to_owned(),
 +    }
 +}
 +
@@ -1289,51 +1263,6 @@ index 00000000..b92c2c0d
 +        .as_deref()
 +        .or(pane.cwd.as_deref())
 +        .filter(|dir| !dir.is_empty())
-+}
-+
-+/// `dir` relative to the space's `home`, or a home-shortened path outside it.
-+fn place_text(dir: &str, home: &str) -> Option<String> {
-+    let dir = dir.trim_end_matches('/');
-+    let home = home.trim_end_matches('/');
-+    if dir == home || dir.is_empty() {
-+        return None;
-+    }
-+    if let Some(inside) = dir
-+        .strip_prefix(home)
-+        .and_then(|rest| rest.strip_prefix('/'))
-+    {
-+        return Some(inside.to_owned());
-+    }
-+    for users in ["/home/", "/Users/"] {
-+        if let Some(rest) = dir.strip_prefix(users) {
-+            return Some(match rest.split_once('/') {
-+                Some((_, below)) => format!("~/{below}"),
-+                None => "~".to_owned(),
-+            });
-+        }
-+    }
-+    Some(dir.to_owned())
-+}
-+
-+/// Keep the end of `text`, which holds the most specific part of a path.
-+fn truncate_start(text: &str, max_width: usize) -> String {
-+    if UnicodeWidthStr::width(text) <= max_width {
-+        return text.to_owned();
-+    }
-+    if max_width == 0 {
-+        return String::new();
-+    }
-+    let mut kept = Vec::new();
-+    let mut width = 1; // the ellipsis
-+    for character in text.chars().rev() {
-+        let character_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
-+        if width + character_width > max_width {
-+            break;
-+        }
-+        width += character_width;
-+        kept.push(character);
-+    }
-+    std::iter::once('…').chain(kept.into_iter().rev()).collect()
 +}
 +
 +/// "2 shells" from the `shells` pane token, which the herdr-shell-count watcher reports
@@ -1451,10 +1380,10 @@ index 00000000..b92c2c0d
 +    }
 +    let mut y = area.y;
 +    for item in &tree.items {
-+        if y.saturating_add(item.height()) > area.bottom() {
++        if y >= area.bottom() {
 +            break;
 +        }
-+        let rect = Rect::new(area.x, y, area.width, item.height());
++        let rect = Rect::new(area.x, y, area.width, 1);
 +        let focused = show_focus && item.focused;
 +        if focused {
 +            buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
@@ -1544,18 +1473,6 @@ index 00000000..b92c2c0d
 +            Rect::new(x, y, (width as u16).saturating_sub(age_width), 1),
 +            buffer,
 +        );
-+        if let Some(place) = &item.place {
-+            let place_x = x.saturating_add(2).min(rect.right());
-+            let place_width = usize::from(rect.right().saturating_sub(place_x));
-+            put_text(
-+                buffer,
-+                place_x,
-+                y + 1,
-+                place_width as u16,
-+                &format!("↳ {}", truncate_start(place, place_width.saturating_sub(2))),
-+                Style::default().fg(palette.overlay0),
-+            );
-+        }
 +        on_line(rect, item);
 +        y = rect.bottom();
 +    }
@@ -2355,34 +2272,28 @@ index 00000000..b92c2c0d
 +        snapshot
 +    }
 +
-+    fn summary(tree: &SpaceTree<'_>) -> Vec<(String, bool, Option<String>)> {
++    fn summary(tree: &SpaceTree<'_>) -> Vec<(String, bool)> {
 +        tree.items
 +            .iter()
-+            .map(|item| {
-+                (
-+                    item.label.clone(),
-+                    item.agent().is_some(),
-+                    item.place.clone(),
-+                )
-+            })
++            .map(|item| (item.label.clone(), item.agent().is_some()))
 +            .collect()
 +    }
 +
 +    #[test]
-+    fn space_tree_lists_tabs_in_order_with_terminals_and_places() {
++    fn space_tree_lists_tabs_in_order_with_terminals_one_line_each() {
 +        let snapshot = fridge();
 +        let tree = space_tree(&snapshot, "ws_1", &HashSet::new());
 +        assert_eq!(
 +            summary(&tree),
 +            [
-+                ("prod".to_owned(), true, None),
-+                ("deploy".to_owned(), true, Some("sub".to_owned())),
-+                ("backend".to_owned(), false, Some("sub".to_owned())),
-+                // Named after its folder, so no separate place line.
-+                ("frontend".to_owned(), false, None),
++                ("prod".to_owned(), true),
++                ("deploy".to_owned(), true),
++                ("backend".to_owned(), false),
++                // An unnamed terminal is named after its folder.
++                ("frontend".to_owned(), false),
 +            ]
 +        );
-+        assert_eq!(tree.height(), 1 + 2 + 2 + 1);
++        assert_eq!(tree.height(), 4);
 +    }
 +
 +    #[test]
@@ -2391,7 +2302,7 @@ index 00000000..b92c2c0d
 +        let hidden = HashSet::from([terminals_hidden_key("ws_1")]);
 +        let tree = space_tree(&snapshot, "ws_1", &hidden);
 +        assert_eq!(tree.items.len(), 2);
-+        assert_eq!(tree.height(), 3);
++        assert_eq!(tree.height(), 2);
 +        // Other spaces are unaffected.
 +        assert_eq!(space_tree(&snapshot, "ws_2", &hidden).items.len(), 1);
 +
@@ -2429,28 +2340,6 @@ index 00000000..b92c2c0d
 +            agent.agent_status = AgentStatus::Working;
 +        }
 +        assert_eq!(agent_cycle(&snapshot), ["p1", "p2", "p5"]);
-+    }
-+
-+    #[test]
-+    fn place_is_relative_inside_the_space_and_home_shortened_outside() {
-+        assert_eq!(place_text("/repo", "/repo/"), None);
-+        assert_eq!(place_text("/repo/a/b", "/repo").as_deref(), Some("a/b"));
-+        assert_eq!(
-+            place_text("/repository", "/repo").as_deref(),
-+            Some("/repository")
-+        );
-+        assert_eq!(
-+            place_text("/home/me/x/y", "/repo").as_deref(),
-+            Some("~/x/y")
-+        );
-+        assert_eq!(place_text("/Users/me/x", "/repo").as_deref(), Some("~/x"));
-+    }
-+
-+    #[test]
-+    fn truncate_start_keeps_the_end() {
-+        assert_eq!(truncate_start("abc", 3), "abc");
-+        assert_eq!(truncate_start("~/workspace/polymarket", 12), "…/polymarket");
-+        assert_eq!(truncate_start("abc", 0), "");
 +    }
 +
 +    #[test]
