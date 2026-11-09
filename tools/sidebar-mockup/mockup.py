@@ -4,10 +4,13 @@ Runs the given herdr binary in a throwaway session (its own config, state and so
 temporary directory, removed afterwards; a herdr you have running is not touched), builds a
 made-up layout of spaces, tabs and agents, and renders the sidebar's cells.
 
-    python3 mockup.py <herdr-binary> <out.png> [--attention] [--hover TEXT] [ENV=VALUE ...]
+    python3 mockup.py <herdr-binary> <out.png> [--attention] [--hover TEXT] [--columns N]
+                      [ENV=VALUE ...]
 
 --attention  puts two agents in "needs input" and two in "finished".
 --hover TEXT moves the mouse onto the first sidebar line containing TEXT.
+--columns N  draws N columns instead of just the sidebar, e.g. to include a hover card.
+             The panes then show too, with your shell prompt (user and host name).
 ENV=VALUE    is passed to herdr, e.g. a switch a prototype reads.
 
 Needs pyte and pillow (`pip install pyte pillow`) and the Hack or DejaVu Sans Mono font.
@@ -185,11 +188,11 @@ class Session:
             pass
 
 
-def render(screen, out):
+def render(screen, out, columns):
     regular, bold = next(pair for pair in FONTS if all(os.path.exists(p) for p in pair))
     font, bold = ImageFont.truetype(regular, 15), ImageFont.truetype(bold, 15)
     cw, ch = 9, 19
-    img = Image.new("RGB", (cw * (SIDEBAR + 1) + 16, ch * ROWS + 16), BG)
+    img = Image.new("RGB", (cw * columns + 16, ch * ROWS + 16), BG)
     draw = ImageDraw.Draw(img)
 
     def color(name, default):
@@ -203,7 +206,7 @@ def render(screen, out):
             return default
 
     for y in range(ROWS):
-        for x in range(SIDEBAR + 1):
+        for x in range(columns):
             c = screen.buffer[y][x]
             px, py = 8 + x * cw, 8 + y * ch
             fg, bg = (c.bg, c.fg) if c.reverse else (c.fg, c.bg)
@@ -222,6 +225,7 @@ def main():
     binary, out = os.path.abspath(args[0]), args[1]
     attention = "--attention" in args
     hover = args[args.index("--hover") + 1] if "--hover" in args else None
+    columns = min(int(args[args.index("--columns") + 1]), COLS) if "--columns" in args else SIDEBAR + 1
     extra_env = dict(a.split("=", 1) for a in args[2:] if "=" in a and not a.startswith("--"))
     # A short path: Unix socket paths are limited to about 100 bytes.
     root = tempfile.mkdtemp(prefix="hm-", dir="/tmp")
@@ -236,9 +240,9 @@ def main():
         if hover:
             session.hover(hover)
         session.pump(1)
-        render(session.screen, out)
+        render(session.screen, out, columns)
         for line in session.screen.display:
-            print(line[:SIDEBAR + 1].rstrip())
+            print(line[:columns].rstrip())
     finally:
         session.close()
         shutil.rmtree(root, ignore_errors=True)

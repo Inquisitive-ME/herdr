@@ -10,11 +10,12 @@ The patches in `patches/`:
    installs read this repository's `latest.json` instead of herdr.dev. CI compiles the
    release tag in, `latest.json` carries it as `release`, and a different release of
    the same upstream version counts as an update. `herdr --version` prints the release.
-2. **State times and pane moves (server).** Agents carry a `state_since_ms` token with
-   when their current state began, kept across a live handoff, and clients may call
+2. **State times, branches and pane moves (server).** Agents carry a `state_since_ms`
+   token with when their current state began, kept across a live handoff, and a
+   `git_branch` token with the branch checked out where they work. Clients may call
    `pane.move`. This changes the server, so a running server needs a restart or
    `herdr server live-handoff --import-exe <new herdr>` (keeps agents running) to pick
-   it up. Older servers just show no ages and refuse cross-space drags.
+   it up. Older servers just show no ages or branches and refuse cross-space drags.
 3. **Agents under their space.** Most of the code is in a new file
    (`src/client/shell/space_agents.rs`) so upstream changes rarely conflict with it.
    - Each space in the sidebar lists its tabs underneath, and clicking one jumps to it.
@@ -56,6 +57,8 @@ The patches in `patches/`:
      under the mouse (a machine, space, tab, collapsed summary or waiting agent) lights
      up a step brighter; the current tab and space keep their own highlight. Both need a
      terminal that reports its background.
+   - Hovering a tab line shows a card beside the sidebar with the folder it works in
+     and, for an agent, its git branch.
    - Plain terminals show `$` in the agent-number column so their names line up with the
      agents', and waiting agents show their tree number in the same column.
    - Dragging a space below the last one marks the bottom edge of the last box.

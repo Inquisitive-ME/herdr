@@ -12,8 +12,10 @@ bottom edge.
 Every other tab of a space, and every other waiting agent, is drawn a
 few percent lighter than the terminal's reported background, and the
 line under the mouse a step lighter still; the focused tab and space
-keep their highlight. Plain terminals show $ in the agent-number column
-and waiting agents carry their tree number there.
+keep their highlight. Hovering a tab line shows a card beside the
+sidebar with the folder it works in and, for agents, the git branch.
+Plain terminals show $ in the agent-number column and waiting agents
+carry their tree number there.
 
 Upstream's mouse_hits_use_stable_workspace_tab_and_pane_ids clicks the
 row that is now a box border and fails by design.
@@ -53,7 +55,7 @@ index d1fef727..0c95c800 100644
              }
          },
 diff --git a/src/client/shell/composition.rs b/src/client/shell/composition.rs
-index 1d644e48..72571108 100644
+index 1d644e48..d462be50 100644
 --- a/src/client/shell/composition.rs
 +++ b/src/client/shell/composition.rs
 @@ -235,6 +235,8 @@ impl ClientShellState {
@@ -65,6 +67,19 @@ index 1d644e48..72571108 100644
          self.paint_space_line_drag(&mut buffer);
          self.hits.panes = surface
              .panes
+@@ -643,6 +645,12 @@ impl ClientShellState {
+         if let Some(bar) = mode_bar {
+             occlusion.cover(bar);
+         }
++        let card_area = if layout.tab_bar.is_empty() {
++            layout.pane_surface
++        } else {
++            layout.tab_bar.union(layout.pane_surface)
++        };
++        self.render_hover_card(&mut frame, card_area, &mut occlusion);
+         if let Some(overlay) = self.overlay.as_ref() {
+             let mut composed = frame.to_ratatui_buffer()?;
+             let cursor = if let ClientShellOverlay::ContextMenu(menu) = overlay {
 diff --git a/src/client/shell/endpoint_agents.rs b/src/client/shell/endpoint_agents.rs
 index cbca4378..e366d369 100644
 --- a/src/client/shell/endpoint_agents.rs
@@ -366,17 +381,20 @@ index 21eea77d..48a5161a 100644
      if show_scrollbar {
          let track = Rect::new(body.right().saturating_sub(1), body.y, 1, body.height);
 diff --git a/src/client/shell/space_agents.rs b/src/client/shell/space_agents.rs
-index b92c2c0d..0b73cdfc 100644
+index b92c2c0d..fca32901 100644
 --- a/src/client/shell/space_agents.rs
 +++ b/src/client/shell/space_agents.rs
-@@ -6,6 +6,7 @@
+@@ -6,8 +6,9 @@
  use std::collections::HashSet;
  
  use ratatui::{
 +    style::Color,
      text::{Line, Span},
-     widgets::{Paragraph, Widget},
+-    widgets::{Paragraph, Widget},
++    widgets::{Block, BorderType, Clear, Paragraph, Widget},
  };
+ 
+ use super::render::put_text;
 @@ -16,6 +17,9 @@ use crate::api::schema::AgentStatus;
  use crate::protocol::{ClientShellAgent, ClientShellPane, ClientShellTab};
  use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
@@ -502,7 +520,31 @@ index b92c2c0d..0b73cdfc 100644
      }
      SpaceTree {
          workspace_id,
-@@ -681,8 +730,24 @@ pub(in crate::client::shell) fn render_space_tree(
+@@ -459,15 +508,20 @@ fn place_text(dir: &str, home: &str) -> Option<String> {
+     {
+         return Some(inside.to_owned());
+     }
++    Some(home_short(dir))
++}
++
++/// `dir` with a home folder shortened to `~`.
++fn home_short(dir: &str) -> String {
+     for users in ["/home/", "/Users/"] {
+         if let Some(rest) = dir.strip_prefix(users) {
+-            return Some(match rest.split_once('/') {
++            return match rest.split_once('/') {
+                 Some((_, below)) => format!("~/{below}"),
+                 None => "~".to_owned(),
+-            });
++            };
+         }
+     }
+-    Some(dir.to_owned())
++    dir.to_owned()
+ }
+ 
+ /// Keep the end of `text`, which holds the most specific part of a path.
+@@ -681,8 +735,24 @@ pub(in crate::client::shell) fn render_space_tree(
                  } else {
                      Style::default().fg(palette.overlay0)
                  };
@@ -528,7 +570,7 @@ index b92c2c0d..0b73cdfc 100644
                      Span::raw(" "),
                      Span::styled(
                          crate::ui::truncate_end(&item.label, width.saturating_sub(2)),
-@@ -717,6 +782,163 @@ pub(in crate::client::shell) fn render_space_tree(
+@@ -717,6 +787,165 @@ pub(in crate::client::shell) fn render_space_tree(
      None
  }
  
@@ -568,6 +610,8 @@ index b92c2c0d..0b73cdfc 100644
 +const TAB_BAND_PERCENT: i32 = 6;
 +/// The same for the line under the mouse: twice the shade, so it reads over it.
 +const HOVER_PERCENT: i32 = 12;
++/// Width of the hover card's "folder" / "branch" label column.
++const HOVER_CARD_LABEL: usize = 8;
 +
 +/// Rows a space's box adds to its list entry: the border above a top-level space, and
 +/// the bottom border under the last space of a list.
@@ -692,7 +736,7 @@ index b92c2c0d..0b73cdfc 100644
  /// One row standing in for a collapsed tree: a count per agent status, then terminals.
  fn render_summary(
      buffer: &mut Buffer,
-@@ -756,7 +978,7 @@ fn render_summary(
+@@ -756,7 +985,7 @@ fn render_summary(
          .count();
      if terminals > 0 {
          spans.push(Span::styled(
@@ -701,7 +745,7 @@ index b92c2c0d..0b73cdfc 100644
              Style::default().fg(palette.overlay0),
          ));
      }
-@@ -903,6 +1125,8 @@ pub(in crate::client::shell) struct SpaceTreeState {
+@@ -903,6 +1132,8 @@ pub(in crate::client::shell) struct SpaceTreeState {
      drag: Option<LineDrag>,
      /// Summary of the age labels last drawn, to repaint only when one changes.
      age_marker: u64,
@@ -710,7 +754,7 @@ index b92c2c0d..0b73cdfc 100644
  }
  
  struct LinePress {
-@@ -1160,6 +1384,90 @@ impl ClientShellState {
+@@ -1160,6 +1391,207 @@ impl ClientShellState {
          }))
      }
  
@@ -798,10 +842,127 @@ index b92c2c0d..0b73cdfc 100644
 +        }
 +    }
 +
++    /// The tab line under the mouse and the snapshot of the machine its pane is on.
++    fn hovered_pane(&self) -> Option<(Rect, &crate::protocol::ClientShellSnapshot, &str)> {
++        let point = self.space_tree.hover?;
++        if let Some((rect, pane_id)) = self
++            .hits
++            .agents
++            .iter()
++            .find(|(rect, _)| super::contains(*rect, point))
++        {
++            return Some((*rect, self.snapshot.as_deref()?, pane_id));
++        }
++        let (rect, endpoint_id, pane_id) = self
++            .hits
++            .endpoint_agents
++            .iter()
++            .find(|(rect, _, _)| super::contains(*rect, point))?;
++        let snapshot = self
++            .endpoints
++            .iter()
++            .find(|endpoint| endpoint.endpoint_id == *endpoint_id)
++            .and_then(|endpoint| endpoint.snapshot.as_deref())
++            .or_else(|| {
++                self.snapshot
++                    .as_deref()
++                    .filter(|_| *endpoint_id == self.active_endpoint_id)
++            })?;
++        Some((*rect, snapshot, pane_id))
++    }
++
++    /// A card beside the sidebar for the tab line under the mouse: the folder it works in
++    /// and, for an agent, the git branch there (which the server reports). Not shown
++    /// during drags or under menus.
++    pub(super) fn render_hover_card(
++        &self,
++        frame: &mut FrameData,
++        area: Rect,
++        occlusion: &mut crate::kitty_graphics::surface::Occlusion,
++    ) {
++        if self.chrome_drag.is_some() || self.space_tree.drag.is_some() || self.overlay.is_some() {
++            return;
++        }
++        let Some((line, snapshot, pane_id)) = self.hovered_pane() else {
++            return;
++        };
++        let folder = snapshot
++            .panes
++            .iter()
++            .find(|pane| pane.pane_id == pane_id)
++            .and_then(pane_dir)
++            .map(home_short);
++        let branch = snapshot
++            .agents
++            .iter()
++            .find(|agent| agent.pane_id == pane_id)
++            .and_then(|agent| {
++                agent
++                    .tokens
++                    .iter()
++                    .find(|(key, _)| key == crate::metadata_tokens::GIT_BRANCH_TOKEN)
++            })
++            .map(|(_, branch)| branch.clone());
++        let rows = [("folder", folder), ("branch", branch)]
++            .into_iter()
++            .filter_map(|(label, value)| Some((label, value?)))
++            .collect::<Vec<_>>();
++        // Borders, a space either side, and the label column.
++        const CHROME: usize = 2 + 2 + HOVER_CARD_LABEL;
++        let widest = rows
++            .iter()
++            .map(|(_, value)| UnicodeWidthStr::width(value.as_str()))
++            .max()
++            .unwrap_or(0);
++        let width = u16::try_from(widest + CHROME)
++            .unwrap_or(u16::MAX)
++            .min(area.width);
++        let height = rows.len() as u16 + 2;
++        if rows.is_empty() || usize::from(width) < CHROME + 6 || height > area.height {
++            return;
++        }
++        let y = line.y.clamp(area.y, area.bottom() - height);
++        let rect = Rect::new(area.x, y, width, height);
++        let Some(mut buffer) = frame.to_ratatui_buffer() else {
++            return;
++        };
++        let palette = &self.config.palette;
++        let block = Block::bordered()
++            .border_type(BorderType::Rounded)
++            .border_style(Style::default().fg(palette.surface1))
++            .style(Style::default().bg(palette.panel_bg));
++        let inner = block.inner(rect);
++        Clear.render(rect, &mut buffer);
++        block.render(rect, &mut buffer);
++        let value_width = usize::from(width) - CHROME;
++        for (row, (label, value)) in rows.iter().enumerate() {
++            let value = if *label == "folder" {
++                truncate_start(value, value_width)
++            } else {
++                crate::ui::truncate_end(value, value_width)
++            };
++            Paragraph::new(Line::from(vec![
++                Span::raw(" "),
++                Span::styled(
++                    format!("{label:<HOVER_CARD_LABEL$}"),
++                    Style::default().fg(palette.overlay0),
++                ),
++                Span::styled(value, Style::default().fg(palette.text)),
++            ]))
++            .render(
++                Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
++                &mut buffer,
++            );
++        }
++        occlusion.cover(rect);
++        let cursor = frame.cursor.clone();
++        frame.replace_from_ratatui_buffer_preserving_effects(&buffer, cursor);
++    }
++
      /// Dim the dragged line and shade where it would land.
      pub(super) fn paint_space_line_drag(&self, buffer: &mut Buffer) {
          let Some(drag) = self.space_tree.drag.as_ref() else {
-@@ -1315,7 +1623,7 @@ mod tests {
+@@ -1315,7 +1747,7 @@ mod tests {
              .iter()
              .map(|entry| match entry {
                  AttentionEntry::Heading(attention) => attention.title(),
@@ -810,7 +971,7 @@ index b92c2c0d..0b73cdfc 100644
              })
              .collect()
      }
-@@ -1332,6 +1640,15 @@ mod tests {
+@@ -1332,6 +1764,15 @@ mod tests {
          let (title, entries) = attention_entries(rows.clone(), |row| row.1);
          assert_eq!(title, " needs input");
          assert_eq!(entry_names(&entries), ["b", "e", " finished", "a", "d"]);
@@ -826,7 +987,7 @@ index b92c2c0d..0b73cdfc 100644
          // Two two-line agents, the two-line heading and two one-line agents.
          assert_eq!(
              attention_list_height(
-@@ -1523,6 +1840,47 @@ mod tests {
+@@ -1523,6 +1964,47 @@ mod tests {
              .collect()
      }
  
@@ -890,10 +1051,10 @@ index a52bca6d..8d97eb91 100644
      pub(super) agent_scrollbar: Rect,
      pub(super) agent_scroll_metrics: Option<crate::pane::ScrollMetrics>,
 diff --git a/src/client/shell/tests/space_tree.rs b/src/client/shell/tests/space_tree.rs
-index 01574926..38a00c61 100644
+index 01574926..283269ee 100644
 --- a/src/client/shell/tests/space_tree.rs
 +++ b/src/client/shell/tests/space_tree.rs
-@@ -459,3 +459,193 @@ fn multi_machine_next_agent_goes_to_the_most_urgent_across_machines() {
+@@ -459,3 +459,239 @@ fn multi_machine_next_agent_goes_to_the_most_urgent_across_machines() {
          ]
      );
  }
@@ -1086,4 +1247,50 @@ index 01574926..38a00c61 100644
 +    let pane = state.hits.panes[0].inner_rect;
 +    assert!(mouse(&mut state, MouseEventKind::Moved, pane).repaint);
 +    assert_eq!(bg(&mut state, personal), palette.sidebar_bg);
++}
++
++#[test]
++fn hovering_a_tab_line_shows_its_folder_and_branch_beside_the_sidebar() {
++    let mut snapshot = tree_snapshot();
++    snapshot.panes[1].foreground_cwd = Some("/home/me/fridge/backend".into());
++    snapshot.panes[2].foreground_cwd = Some("/Users/me/notes".into());
++    snapshot.agents[1].tokens = vec![("git_branch".into(), "feature/card".into())];
++    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
++    state.set_snapshot(Box::new(snapshot));
++    state.set_pane_surface(surface());
++    state.compose(106, 30).expect("frame");
++    // Where `text` starts in the frame, by cells.
++    let find = |frame: &FrameData, text: &str| {
++        let chars = text.chars().map(String::from).collect::<Vec<_>>();
++        (0..frame.height).find_map(|y| {
++            (0..frame.width.saturating_sub(chars.len() as u16))
++                .find(|x| {
++                    chars
++                        .iter()
++                        .enumerate()
++                        .all(|(i, ch)| cell(frame, x + i as u16, y) == ch)
++                })
++                .map(|x| (x, y))
++        })
++    };
++    let sidebar_right = state.hits.workspace_body.right();
++
++    let deploy = line(&state, "pane_2");
++    assert!(mouse(&mut state, MouseEventKind::Moved, deploy).repaint);
++    let frame = state.compose(106, 30).expect("frame");
++    let (x, y) = find(&frame, "folder  ~/fridge/backend").expect("folder row");
++    assert!(x >= sidebar_right);
++    assert_eq!(find(&frame, "branch  feature/card"), Some((x, y + 1)));
++
++    // A plain terminal has no branch to report.
++    let server = line(&state, "pane_3");
++    mouse(&mut state, MouseEventKind::Moved, server);
++    let frame = state.compose(106, 30).expect("frame");
++    assert!(find(&frame, "folder  ~/notes").is_some());
++    assert_eq!(find(&frame, "branch"), None);
++
++    let pane = state.hits.panes[0].inner_rect;
++    mouse(&mut state, MouseEventKind::Moved, pane);
++    let frame = state.compose(106, 30).expect("frame");
++    assert_eq!(find(&frame, "folder"), None);
 +}

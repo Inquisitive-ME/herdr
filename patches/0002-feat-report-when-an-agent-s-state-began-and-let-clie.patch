@@ -9,7 +9,9 @@ last state change, so clients can show how long an agent has been
 working or waiting. A live handoff carries each agent's state and start
 time, and keeps the start when detection re-finds the same state.
 pane.move joins the client shell methods so the sidebar can move panes
-between spaces.
+between spaces. Client snapshots give each agent a git_branch token
+with the branch checked out where it works, read at most every few
+seconds per folder.
 
 diff --git a/src/app/actions.rs b/src/app/actions.rs
 index f01dd05b..9fe15686 100644
@@ -154,15 +156,17 @@ index 12481f6d..f9c87e78 100644
  
  #[cfg(unix)]
 diff --git a/src/metadata_tokens.rs b/src/metadata_tokens.rs
-index f79e8ae2..3f83b4be 100644
+index f79e8ae2..e3e3d86a 100644
 --- a/src/metadata_tokens.rs
 +++ b/src/metadata_tokens.rs
-@@ -14,6 +14,9 @@ pub(crate) struct MetadataTokens {
+@@ -14,6 +14,11 @@ pub(crate) struct MetadataTokens {
  
  pub(crate) const MAX_SEQUENCE_SOURCES: usize = 32;
  
 +/// Fork: token the server adds to agents with when their current state began (Unix ms).
 +pub(crate) const STATE_SINCE_TOKEN: &str = "state_since_ms";
++/// Fork: token the server adds to agents with the git branch checked out where they work.
++pub(crate) const GIT_BRANCH_TOKEN: &str = "git_branch";
 +
  pub(crate) fn sequence_is_fresh(
      sequences: &HashMap<String, u64>,
@@ -236,6 +240,79 @@ index 87824c85..9eeae663 100644
  
          assert_eq!(
              actual, expected,
+diff --git a/src/server/client_shell.rs b/src/server/client_shell.rs
+index 0a98da09..055e7fe6 100644
+--- a/src/server/client_shell.rs
++++ b/src/server/client_shell.rs
+@@ -157,6 +157,17 @@ pub(super) fn snapshot_with_completions(
+             let mut state_labels = agent.state_labels.into_iter().collect::<Vec<_>>();
+             state_labels.sort_by(|left, right| left.0.cmp(&right.0));
+             let mut tokens = agent.tokens.into_iter().collect::<Vec<_>>();
++            // Fork: the branch where the agent works, for the sidebar's hover card.
++            let branch_token = crate::metadata_tokens::GIT_BRANCH_TOKEN;
++            if let Some(branch) = agent
++                .foreground_cwd
++                .as_deref()
++                .or(agent.cwd.as_deref())
++                .and_then(cached_git_branch)
++                .filter(|_| !tokens.iter().any(|(key, _)| key == branch_token))
++            {
++                tokens.push((branch_token.to_owned(), branch));
++            }
+             tokens.sort_by(|left, right| left.0.cmp(&right.0));
+             protocol::ClientShellAgent {
+                 pane_id,
+@@ -625,6 +636,28 @@ fn split_hit_rect(
+     Some(hit)
+ }
+ 
++/// Fork: the git branch checked out in `dir`. Snapshots are rebuilt every frame, so each
++/// folder is read at most every few seconds.
++fn cached_git_branch(dir: &str) -> Option<String> {
++    use std::collections::BTreeMap;
++    use std::sync::Mutex;
++    use std::time::{Duration, Instant};
++    const FRESH_FOR: Duration = Duration::from_secs(3);
++    static CACHE: Mutex<BTreeMap<String, (Instant, Option<String>)>> = Mutex::new(BTreeMap::new());
++    let mut cache = CACHE
++        .lock()
++        .unwrap_or_else(|poisoned| poisoned.into_inner());
++    if let Some((read_at, branch)) = cache.get(dir) {
++        if read_at.elapsed() < FRESH_FOR {
++            return branch.clone();
++        }
++    }
++    cache.retain(|_, (read_at, _)| read_at.elapsed() < FRESH_FOR);
++    let branch = crate::workspace::git_branch(std::path::Path::new(dir));
++    cache.insert(dir.to_owned(), (Instant::now(), branch.clone()));
++    branch
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -717,6 +750,21 @@ mod tests {
+             .all(|runtime| runtime.test_scroll_metrics_reads() == 1));
+     }
+ 
++    #[test]
++    fn fork_git_branch_is_read_once_per_folder_every_few_seconds() {
++        let repo = std::env::temp_dir().join(format!("herdr-branch-{}", std::process::id()));
++        let git = repo.join(".git");
++        std::fs::create_dir_all(git.join("refs/heads")).unwrap();
++        std::fs::write(git.join("HEAD"), "ref: refs/heads/feature/card\n").unwrap();
++        let dir = repo.to_str().unwrap();
++        assert_eq!(cached_git_branch(dir).as_deref(), Some("feature/card"));
++        // A checkout shows up on a later read, not on every frame.
++        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
++        assert_eq!(cached_git_branch(dir).as_deref(), Some("feature/card"));
++        assert_eq!(cached_git_branch("/nonexistent/herdr/dir"), None);
++        std::fs::remove_dir_all(&repo).unwrap();
++    }
++
+     #[test]
+     fn snapshot_projects_cached_release_and_update_facts() {
+         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
 diff --git a/src/server/headless/lifecycle.rs b/src/server/headless/lifecycle.rs
 index 8c6587ff..ce965c99 100644
 --- a/src/server/headless/lifecycle.rs
