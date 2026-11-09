@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Richard Swanson <rswanson05@gmail.com>
+Date: Mon, 9 Nov 2026 14:56:47 -0600
+Subject: [PATCH] feat: filter agent list by workspace
+
+herdr agent list --workspace <id> lists only the agents in that
+workspace, the way herdr tab list --workspace already filters tabs. An
+agent can pass $HERDR_WORKSPACE_ID to see the other agents in its own
+space. The CLI filters the server's full list, so it works against
+servers of any version.
+
+diff --git a/src/cli/agent.rs b/src/cli/agent.rs
+index 09043460..e2be7813 100644
+--- a/src/cli/agent.rs
++++ b/src/cli/agent.rs
+@@ -436,15 +436,29 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
+ }
+ 
+ fn agent_list(args: &[String]) -> std::io::Result<i32> {
+-    if !args.is_empty() {
+-        eprintln!("usage: herdr agent list");
+-        return Ok(2);
+-    }
++    let workspace_id = match args {
++        [] => None,
++        [flag, value] if flag == "--workspace" => Some(super::normalize_workspace_id(value)),
++        _ => {
++            eprintln!("usage: herdr agent list [--workspace <workspace_id>]");
++            return Ok(2);
++        }
++    };
+ 
+-    super::print_response(&super::send_request(&Request {
++    let mut response = super::send_request(&Request {
+         id: "cli:agent:list".into(),
+         method: Method::AgentList(EmptyParams::default()),
+-    })?)
++    })?;
++    // Fork: filtered here rather than by the server, so it works against any server.
++    if let Some(workspace_id) = workspace_id {
++        if let Some(agents) = response
++            .pointer_mut("/result/agents")
++            .and_then(serde_json::Value::as_array_mut)
++        {
++            agents.retain(|agent| agent["workspace_id"] == workspace_id.as_str());
++        }
++    }
++    super::print_response(&response)
+ }
+ 
+ fn agent_get(args: &[String]) -> std::io::Result<i32> {
+@@ -931,7 +945,7 @@ fn agent_read(args: &[String]) -> std::io::Result<i32> {
+ 
+ fn print_agent_help() {
+     eprintln!("herdr agent commands:");
+-    eprintln!("  herdr agent list");
++    eprintln!("  herdr agent list [--workspace <workspace_id>]");
+     eprintln!("  herdr agent get <target>");
+     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
+     eprintln!("  herdr agent send-keys <target> <key> [key ...]");
+diff --git a/src/cli/spec.rs b/src/cli/spec.rs
+index 9a503a18..4b9a0a41 100644
+--- a/src/cli/spec.rs
++++ b/src/cli/spec.rs
+@@ -323,7 +323,11 @@ fn notification_command() -> Command {
+ fn agent_command() -> Command {
+     Command::new("agent")
+         .about("Control and inspect agent panes")
+-        .subcommand(Command::new("list").about("List agents"))
++        .subcommand(
++            Command::new("list")
++                .about("List agents")
++                .arg(option("workspace", "WORKSPACE_ID")),
++        )
+         .subcommand(id_command("get", "target", "Show an agent"))
+         .subcommand(
+             Command::new("read")
+diff --git a/tests/cli/agents.rs b/tests/cli/agents.rs
+index cc5af061..9f319b75 100644
+--- a/tests/cli/agents.rs
++++ b/tests/cli/agents.rs
+@@ -1082,6 +1082,82 @@ fn agent_commands_work() {
+     cleanup_spawned_herdr(herdr, base);
+ }
+ 
++#[test]
++fn fork_agent_list_filters_by_workspace() {
++    let base = unique_test_dir();
++    let config_home = base.join("config");
++    let runtime_dir = base.join("runtime");
++    let socket_path = runtime_dir.join("herdr.sock");
++
++    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
++    wait_for_socket(&socket_path, Duration::from_secs(5));
++
++    // Two spaces with one agent each.
++    let mut spaces = Vec::new();
++    for name in ["first", "second"] {
++        let created = run_cli_json(
++            &socket_path,
++            &[
++                "workspace",
++                "create",
++                "--cwd",
++                base.to_str().unwrap(),
++                "--label",
++                name,
++            ],
++        );
++        let workspace_id = created["result"]["workspace"]["workspace_id"]
++            .as_str()
++            .unwrap()
++            .to_string();
++        let pane_id = created["result"]["root_pane"]["pane_id"]
++            .as_str()
++            .unwrap()
++            .to_string();
++        let reported = run_cli(
++            &socket_path,
++            &[
++                "pane",
++                "report-agent",
++                &pane_id,
++                "--source",
++                "custom:test",
++                "--agent",
++                "pi",
++                "--state",
++                "idle",
++            ],
++        );
++        assert!(reported.status.success());
++        spaces.push((workspace_id, pane_id));
++    }
++    let pane_ids = |listed: &serde_json::Value| -> Vec<String> {
++        listed["result"]["agents"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .map(|agent| agent["pane_id"].as_str().unwrap().to_string())
++            .collect()
++    };
++
++    let all = run_cli_json(&socket_path, &["agent", "list"]);
++    assert_eq!(pane_ids(&all).len(), 2);
++    for (workspace_id, pane_id) in &spaces {
++        let listed = run_cli_json(
++            &socket_path,
++            &["agent", "list", "--workspace", workspace_id],
++        );
++        assert_eq!(listed["result"]["type"], "agent_list");
++        assert_eq!(pane_ids(&listed), std::slice::from_ref(pane_id));
++    }
++    let none = run_cli_json(&socket_path, &["agent", "list", "--workspace", "missing"]);
++    assert!(pane_ids(&none).is_empty());
++    let bad = run_cli(&socket_path, &["agent", "list", "--workspace"]);
++    assert_eq!(bad.status.code(), Some(2));
++
++    cleanup_spawned_herdr(herdr, base);
++}
++
+ #[test]
+ fn agent_wait_returns_immediately_for_unseen_done_agent() {
+     let base = unique_test_dir();

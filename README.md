@@ -60,6 +60,9 @@ The patches in `patches/`:
    - Dragging a space below the last one marks the bottom edge of the last box.
    - Upstream's `mouse_hits_use_stable_workspace_tab_and_pane_ids` clicks the row that is
      now a box border and fails by design.
+5. **`herdr agent list --workspace <id>`** lists only that space's agents, like
+   `herdr tab list --workspace`. An agent can pass `$HERDR_WORKSPACE_ID` to see the
+   other agents in its space. The CLI does the filtering, so any server works.
 
 Builds: Linux x86_64, Linux ARM (aarch64) and Apple Silicon macOS. There are no
 Windows or Intel Mac builds; use upstream herdr there.
