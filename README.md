@@ -46,15 +46,13 @@ The patches in `patches/`:
      `first_snapshot_establishes_an_idle_baseline_without_server_seen_authority`,
      `local_agent_click_can_cancel_a_pending_remote_switch` and
      `switching_machines_preserves_aggregate_agent_scroll_and_visible_rows`.
-4. **Boxes, shading and hover.**
+4. **Boxes and hover.**
    - Each space and its tree sit in a box; neighbouring spaces share a border row, and
      in the multi-machine sidebar each machine's spaces are boxed under its name.
      Sidebars narrower than 12 columns go without.
-   - Every other tab in a space, and every other agent in the needs-input and finished
-     groups, is shaded a few percent lighter than the terminal's background. The line
-     under the mouse (a machine, space, tab, collapsed summary or waiting agent) lights
-     up a step brighter; the current tab and space keep their own highlight. Both need a
-     terminal that reports its background.
+   - The line under the mouse (a machine, space, tab, collapsed summary or waiting
+     agent) lights up a little brighter than the background; the current tab and space
+     keep their own highlight. Needs a terminal that reports its background.
    - Hovering a tab line shows a card beside the sidebar with the folder it works in
      and, for an agent, its git branch.
    - Plain terminals show `$` in the agent-number column so their names line up with the
