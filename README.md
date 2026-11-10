@@ -67,6 +67,17 @@ The patches in `patches/`:
 5. **`herdr agent list --workspace <id>`** lists only that space's agents, like
    `herdr tab list --workspace`. An agent can pass `$HERDR_WORKSPACE_ID` to see the
    other agents in its space. The CLI does the filtering, so any server works.
+6. **Jump between an agent's turns (server).** Each time an agent goes idle, the server
+   marks that spot in the pane's scrollback: where its answer ended, and where your next
+   message will start. `Ctrl+b ↑` / `Ctrl+b ↓` scroll to the previous / next answer's
+   end (shown at the bottom of the view); `Ctrl+b Shift+↑` / `Ctrl+b Shift+↓` to the start
+   of your previous / next message (shown at the top). Going past the newest one returns
+   to live output, and the output itself is untouched.
+   - The keys are `previous_stop`, `next_stop`, `previous_input` and `next_input`.
+   - A message counts when you typed into the pane before the agent started working.
+   - Marks sit on Claude Code's prompt line; other agents get the cursor's row. Marks
+     only exist for turns since the server started, and go away with their lines.
+   - This changes the server: a running server needs the live handoff (below).
 
 Builds: Linux x86_64, Linux ARM (aarch64) and Apple Silicon macOS. There are no
 Windows or Intel Mac builds; use upstream herdr there.

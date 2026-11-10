@@ -1,0 +1,1158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Richard Swanson <rswanson05@gmail.com>
+Date: Tue, 10 Nov 2026 06:36:05 -0600
+Subject: [PATCH] feat: jump between agent turns in the scrollback
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The server marks a pane's scrollback each time its agent goes idle, at
+the top of the agent's prompt area (Claude Code's rule above its ❯
+prompt, else the cursor row): where its answer ended and where the
+user's next message will be printed. When the agent next starts working
+and keys were typed in between, the mark also counts as a message.
+Marks are libghostty tracked rows, so they follow new output, reflow
+and scrollback pruning, and vanish with their rows.
+
+pane.scroll_to_mark scrolls a pane to the previous or next turn end
+(shown at the bottom of the view) or message (shown at the top). The
+newest turn end is skipped until it is answered, since it sits right
+above the prompt. New keys previous_stop/next_stop (prefix+up/down) and
+previous_input/next_input (prefix+shift+up/down) call it.
+
+diff --git a/crates/ghostty-vt/src/lib.rs b/crates/ghostty-vt/src/lib.rs
+index 4bf36754..ce06cca6 100644
+--- a/crates/ghostty-vt/src/lib.rs
++++ b/crates/ghostty-vt/src/lib.rs
+@@ -1281,6 +1281,26 @@ impl Terminal {
+         (result == ffi::GhosttyResult_GHOSTTY_SUCCESS).then_some(point.y as usize)
+     }
+ 
++    /// Fork: start tracking a row, counted from the top of the scrollback.
++    pub fn track_screen_row(&mut self, y: usize) -> Option<TrackedRow> {
++        let y = u32::try_from(y).ok()?;
++        let mut tracked = ptr::null_mut();
++        let result = unsafe {
++            ffi::ghostty_terminal_grid_ref_track(self.raw, ghostty_screen_point(0, y), &mut tracked)
++        };
++        (result == ffi::GhosttyResult_GHOSTTY_SUCCESS && !tracked.is_null())
++            .then_some(TrackedRow(tracked))
++    }
++
++    /// Fork: where a tracked row is now, counted from the top of the scrollback; None
++    /// once the terminal discarded it (pruned from the scrollback or cleared).
++    pub fn tracked_screen_row(&self, row: &TrackedRow) -> Option<usize> {
++        let mut point = ffi::GhosttyPointCoordinate::default();
++        let tag = ffi::GhosttyPointTag_GHOSTTY_POINT_TAG_SCREEN;
++        let result = unsafe { ffi::ghostty_tracked_grid_ref_point(row.0, tag, &mut point) };
++        (result == ffi::GhosttyResult_GHOSTTY_SUCCESS).then_some(point.y as usize)
++    }
++
+     pub fn screen_cell(&self, x: u16, y: u32) -> Result<(CellWide, Vec<u32>), Error> {
+         let grid_ref = self.grid_ref(ghostty_screen_point(x, y))?;
+         let wide = grid_ref_wide(&grid_ref)?;
+@@ -2303,6 +2323,20 @@ impl Drop for KittyPlacementIteratorGuard {
+ // SAFETY: these opaque handles are only used behind external synchronization in pane runtime.
+ unsafe impl Send for Terminal {}
+ 
++/// Fork: a row that moves with the terminal's content (new output, scrollback pruning,
++/// reflow) until the terminal discards it. Read it through the terminal that made it.
++pub struct TrackedRow(ffi::GhosttyTrackedGridRef);
++
++// SAFETY: the reference is only read through `Terminal::tracked_screen_row`, so callers
++// serialize it with the terminal, and libghostty allows freeing it after the terminal.
++unsafe impl Send for TrackedRow {}
++
++impl Drop for TrackedRow {
++    fn drop(&mut self) {
++        unsafe { ffi::ghostty_tracked_grid_ref_free(self.0) };
++    }
++}
++
+ impl Drop for Terminal {
+     fn drop(&mut self) {
+         // SAFETY: freeing a null or live handle is allowed by the C API.
+diff --git a/docs/next/api/herdr-api.schema.json b/docs/next/api/herdr-api.schema.json
+index e2553f75..7da94d0c 100644
+--- a/docs/next/api/herdr-api.schema.json
++++ b/docs/next/api/herdr-api.schema.json
+@@ -2676,6 +2676,27 @@
+           },
+           "type": "object"
+         },
++        "PaneMarkDirection": {
++          "enum": [
++            "previous",
++            "next"
++          ],
++          "type": "string"
++        },
++        "PaneMarkKind": {
++          "oneOf": [
++            {
++              "const": "turn_end",
++              "description": "Where an agent's answer ended; shown at the bottom of the view.",
++              "type": "string"
++            },
++            {
++              "const": "input",
++              "description": "Where a user message began; shown at the top of the view.",
++              "type": "string"
++            }
++          ]
++        },
+         "PaneMoveDestination": {
+           "oneOf": [
+             {
+@@ -3132,6 +3153,26 @@
+           ],
+           "type": "object"
+         },
++        "PaneScrollToMarkParams": {
++          "description": "Fork: scroll a pane to the previous or next place an agent turn ended or a user\nmessage began, from the marks the server keeps as agents go idle and working.",
++          "properties": {
++            "direction": {
++              "$ref": "#/schemas/request/$defs/PaneMarkDirection"
++            },
++            "mark": {
++              "$ref": "#/schemas/request/$defs/PaneMarkKind"
++            },
++            "pane_id": {
++              "type": "string"
++            }
++          },
++          "required": [
++            "pane_id",
++            "mark",
++            "direction"
++          ],
++          "type": "object"
++        },
+         "PaneSelectionReadParams": {
+           "properties": {
+             "anchor": {
+@@ -5657,6 +5698,22 @@
+           ],
+           "type": "object"
+         },
++        {
++          "properties": {
++            "method": {
++              "const": "pane.scroll_to_mark",
++              "type": "string"
++            },
++            "params": {
++              "$ref": "#/schemas/request/$defs/PaneScrollToMarkParams"
++            }
++          },
++          "required": [
++            "method",
++            "params"
++          ],
++          "type": "object"
++        },
+         {
+           "properties": {
+             "method": {
+diff --git a/src/api/mod.rs b/src/api/mod.rs
+index 86f90da8..a6088371 100644
+--- a/src/api/mod.rs
++++ b/src/api/mod.rs
+@@ -59,6 +59,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
+             | Method::PaneFocusDirection(_)
+             | Method::PaneResize(_)
+             | Method::PaneScroll(_)
++            | Method::PaneScrollToMark(_)
+             | Method::PaneClear(_)
+             | Method::PaneEditScrollback(_)
+             | Method::PaneFocus(_)
+diff --git a/src/api/schema.rs b/src/api/schema.rs
+index 439ed331..d0313016 100644
+--- a/src/api/schema.rs
++++ b/src/api/schema.rs
+@@ -167,6 +167,8 @@ pub enum Method {
+     PaneResize(PaneResizeParams),
+     #[serde(rename = "pane.scroll")]
+     PaneScroll(PaneScrollParams),
++    #[serde(rename = "pane.scroll_to_mark")]
++    PaneScrollToMark(PaneScrollToMarkParams),
+     #[serde(rename = "pane.clear")]
+     PaneClear(PaneTarget),
+     #[serde(rename = "pane.edit_scrollback")]
+diff --git a/src/api/schema/panes.rs b/src/api/schema/panes.rs
+index 9dbe0221..93eafe24 100644
+--- a/src/api/schema/panes.rs
++++ b/src/api/schema/panes.rs
+@@ -240,6 +240,31 @@ pub struct PaneScrollParams {
+     pub offset_from_bottom: u64,
+ }
+ 
++/// Fork: scroll a pane to the previous or next place an agent turn ended or a user
++/// message began, from the marks the server keeps as agents go idle and working.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
++pub struct PaneScrollToMarkParams {
++    pub pane_id: String,
++    pub mark: PaneMarkKind,
++    pub direction: PaneMarkDirection,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
++#[serde(rename_all = "snake_case")]
++pub enum PaneMarkKind {
++    /// Where an agent's answer ended; shown at the bottom of the view.
++    TurnEnd,
++    /// Where a user message began; shown at the top of the view.
++    Input,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
++#[serde(rename_all = "snake_case")]
++pub enum PaneMarkDirection {
++    Previous,
++    Next,
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+ pub struct PaneTextPoint {
+     pub row: u32,
+diff --git a/src/api/server.rs b/src/api/server.rs
+index 0a4cfa66..110a54d3 100644
+--- a/src/api/server.rs
++++ b/src/api/server.rs
+@@ -664,6 +664,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
+         Method::PaneFocusDirection(_) => "pane.focus_direction",
+         Method::PaneResize(_) => "pane.resize",
+         Method::PaneScroll(_) => "pane.scroll",
++        Method::PaneScrollToMark(_) => "pane.scroll_to_mark",
+         Method::PaneClear(_) => "pane.clear",
+         Method::PaneEditScrollback(_) => "pane.edit_scrollback",
+         Method::PaneSelectionRead(_) => "pane.selection.read",
+diff --git a/src/app/api.rs b/src/app/api.rs
+index dd87c508..553cd27c 100644
+--- a/src/app/api.rs
++++ b/src/app/api.rs
+@@ -686,7 +686,27 @@ impl App {
+         });
+     }
+ 
++    /// Fork: mark where an agent's turn ended and where the user's next message begins.
++    fn fork_mark_turn(&self, update: &crate::app::actions::PaneStateUpdate) {
++        use crate::detect::AgentState;
++        let Some(runtime) = self.state.runtime_for_pane_in_workspace(
++            &self.terminal_runtimes,
++            update.ws_idx,
++            update.pane_id,
++        ) else {
++            return;
++        };
++        match (update.previous_state, update.state) {
++            (previous, AgentState::Idle) if previous != AgentState::Idle => runtime.fork_mark_idle(
++                matches!(previous, AgentState::Working | AgentState::Blocked),
++            ),
++            (AgentState::Idle, AgentState::Working) => runtime.fork_mark_working(),
++            _ => {}
++        }
++    }
++
+     pub(crate) fn emit_pane_state_update(&mut self, update: &crate::app::actions::PaneStateUpdate) {
++        self.fork_mark_turn(update);
+         let Some(pane_id) = self.public_pane_id(update.ws_idx, update.pane_id) else {
+             return;
+         };
+@@ -1160,6 +1180,9 @@ impl App {
+             }
+             Method::PaneResize(params) => return self.handle_pane_resize(request.id, params),
+             Method::PaneScroll(params) => return self.handle_pane_scroll(request.id, params),
++            Method::PaneScrollToMark(params) => {
++                return self.handle_pane_scroll_to_mark(request.id, params)
++            }
+             Method::PaneClear(target) => return self.handle_pane_clear(request.id, target),
+             Method::PaneEditScrollback(target) => {
+                 return self.handle_pane_edit_scrollback(request.id, target);
+diff --git a/src/app/api/panes.rs b/src/app/api/panes.rs
+index b5f3baf6..44661053 100644
+--- a/src/app/api/panes.rs
++++ b/src/app/api/panes.rs
+@@ -209,6 +209,39 @@ impl App {
+         encode_success(id, ResponseResult::PaneInfo { pane })
+     }
+ 
++    /// Fork: jump to the previous or next turn end or user message.
++    pub(super) fn handle_pane_scroll_to_mark(
++        &mut self,
++        id: String,
++        params: crate::api::schema::PaneScrollToMarkParams,
++    ) -> String {
++        use crate::api::schema::{PaneMarkDirection, PaneMarkKind};
++        use crate::pane::turn_marks::{MarkDirection, MarkKind};
++        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
++            return pane_not_found(id, &params.pane_id);
++        };
++        let Some(runtime) =
++            self.state
++                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
++        else {
++            return pane_not_found(id, &params.pane_id);
++        };
++        runtime.fork_scroll_to_mark(
++            match params.mark {
++                PaneMarkKind::TurnEnd => MarkKind::TurnEnd,
++                PaneMarkKind::Input => MarkKind::Input,
++            },
++            match params.direction {
++                PaneMarkDirection::Previous => MarkDirection::Previous,
++                PaneMarkDirection::Next => MarkDirection::Next,
++            },
++        );
++        let Some(pane) = self.pane_info(ws_idx, pane_id) else {
++            return pane_not_found(id, &params.pane_id);
++        };
++        encode_success(id, ResponseResult::PaneInfo { pane })
++    }
++
+     pub(super) fn handle_pane_edit_scrollback(&mut self, id: String, target: PaneTarget) -> String {
+         let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
+             return pane_not_found(id, &target.pane_id);
+diff --git a/src/client/shell/actions.rs b/src/client/shell/actions.rs
+index d0dd8ecb..3c1a7e9f 100644
+--- a/src/client/shell/actions.rs
++++ b/src/client/shell/actions.rs
+@@ -1102,6 +1102,30 @@ impl ClientShellState {
+             KeybindAction::EditScrollback => Some(Method::PaneEditScrollback(PaneTarget {
+                 pane_id: focused_pane?,
+             })),
++            // Fork: jump between agent turns in the scrollback.
++            KeybindAction::PreviousStop
++            | KeybindAction::NextStop
++            | KeybindAction::PreviousInput
++            | KeybindAction::NextInput => {
++                use crate::api::schema::{PaneMarkDirection, PaneMarkKind};
++                let (mark, direction) = match action {
++                    KeybindAction::PreviousStop => {
++                        (PaneMarkKind::TurnEnd, PaneMarkDirection::Previous)
++                    }
++                    KeybindAction::NextStop => (PaneMarkKind::TurnEnd, PaneMarkDirection::Next),
++                    KeybindAction::PreviousInput => {
++                        (PaneMarkKind::Input, PaneMarkDirection::Previous)
++                    }
++                    _ => (PaneMarkKind::Input, PaneMarkDirection::Next),
++                };
++                Some(Method::PaneScrollToMark(
++                    crate::api::schema::PaneScrollToMarkParams {
++                        pane_id: focused_pane?,
++                        mark,
++                        direction,
++                    },
++                ))
++            }
+             KeybindAction::ResizePaneLeft
+             | KeybindAction::ResizePaneDown
+             | KeybindAction::ResizePaneUp
+diff --git a/src/config/keybinds.rs b/src/config/keybinds.rs
+index 276764a6..a5b1d383 100644
+--- a/src/config/keybinds.rs
++++ b/src/config/keybinds.rs
+@@ -380,6 +380,10 @@ pub struct Keybinds {
+     pub close_tab: ActionKeybinds,
+     pub rename_pane: ActionKeybinds,
+     pub edit_scrollback: ActionKeybinds,
++    pub previous_stop: ActionKeybinds,
++    pub next_stop: ActionKeybinds,
++    pub previous_input: ActionKeybinds,
++    pub next_input: ActionKeybinds,
+     pub clear_pane: ActionKeybinds,
+     pub copy_mode: ActionKeybinds,
+     pub focus_pane_left: ActionKeybinds,
+@@ -563,6 +567,10 @@ impl Config {
+             close_tab: empty_action!(),
+             rename_pane: empty_action!(),
+             edit_scrollback: empty_action!(),
++            previous_stop: empty_action!(),
++            next_stop: empty_action!(),
++            previous_input: empty_action!(),
++            next_input: empty_action!(),
+             clear_pane: empty_action!(),
+             copy_mode: empty_action!(),
+             focus_pane_left: empty_action!(),
+@@ -711,6 +719,10 @@ impl Config {
+             apply_action!(keybinds.close_tab, close_tab, source);
+             apply_action!(keybinds.rename_pane, rename_pane, source);
+             apply_action!(keybinds.edit_scrollback, edit_scrollback, source);
++            apply_action!(keybinds.previous_stop, previous_stop, source);
++            apply_action!(keybinds.next_stop, next_stop, source);
++            apply_action!(keybinds.previous_input, previous_input, source);
++            apply_action!(keybinds.next_input, next_input, source);
+             apply_action!(keybinds.clear_pane, clear_pane, source);
+             apply_action!(keybinds.copy_mode, copy_mode, source);
+             apply_action!(keybinds.focus_pane_left, focus_pane_left, source);
+diff --git a/src/config/model.rs b/src/config/model.rs
+index 29802fd9..2748c275 100644
+--- a/src/config/model.rs
++++ b/src/config/model.rs
+@@ -409,6 +409,14 @@ pub struct KeysConfig {
+     pub rename_pane: BindingConfig,
+     /// Open the focused pane scrollback in $EDITOR. Default: "prefix+e".
+     pub edit_scrollback: BindingConfig,
++    /// Fork: Scroll to where the agent's previous answer ended. Default: "prefix+up".
++    pub previous_stop: BindingConfig,
++    /// Fork: Scroll to where the agent's next answer ended, or back to live output. Default: "prefix+down".
++    pub next_stop: BindingConfig,
++    /// Fork: Scroll to the start of your previous message to the agent. Default: "prefix+shift+up".
++    pub previous_input: BindingConfig,
++    /// Fork: Scroll to the start of your next message to the agent, or back to live output. Default: "prefix+shift+down".
++    pub next_input: BindingConfig,
+     pub clear_pane: BindingConfig,
+     /// Enter keyboard copy mode for the focused pane. Default: "prefix+[".
+     pub copy_mode: BindingConfig,
+@@ -546,6 +554,14 @@ pub(crate) struct KeysConfigOverlay {
+     rename_pane: Option<BindingConfig>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     edit_scrollback: Option<BindingConfig>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    previous_stop: Option<BindingConfig>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    next_stop: Option<BindingConfig>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    previous_input: Option<BindingConfig>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    next_input: Option<BindingConfig>,
+     clear_pane: Option<BindingConfig>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     copy_mode: Option<BindingConfig>,
+@@ -680,6 +696,10 @@ impl<'de> Deserialize<'de> for KeysConfig {
+         apply_field!(close_tab);
+         apply_field!(rename_pane);
+         apply_field!(edit_scrollback);
++        apply_field!(previous_stop);
++        apply_field!(next_stop);
++        apply_field!(previous_input);
++        apply_field!(next_input);
+         apply_field!(clear_pane);
+         apply_field!(copy_mode);
+         apply_field!(focus_pane_left);
+@@ -785,6 +805,10 @@ impl KeysConfig {
+         copy_effective_action_field!(close_tab, keybinds.close_tab);
+         copy_effective_action_field!(rename_pane, keybinds.rename_pane);
+         copy_effective_action_field!(edit_scrollback, keybinds.edit_scrollback);
++        copy_effective_action_field!(previous_stop, keybinds.previous_stop);
++        copy_effective_action_field!(next_stop, keybinds.next_stop);
++        copy_effective_action_field!(previous_input, keybinds.previous_input);
++        copy_effective_action_field!(next_input, keybinds.next_input);
+         copy_effective_action_field!(clear_pane, keybinds.clear_pane);
+         copy_effective_action_field!(copy_mode, keybinds.copy_mode);
+         copy_effective_action_field!(focus_pane_left, keybinds.focus_pane_left);
+@@ -1157,6 +1181,10 @@ impl Default for KeysConfig {
+             close_tab: BindingConfig::one("prefix+shift+x"),
+             rename_pane: BindingConfig::one("prefix+shift+p"),
+             edit_scrollback: BindingConfig::one("prefix+e"),
++            previous_stop: BindingConfig::one("prefix+up"),
++            next_stop: BindingConfig::one("prefix+down"),
++            previous_input: BindingConfig::one("prefix+shift+up"),
++            next_input: BindingConfig::one("prefix+shift+down"),
+             clear_pane: BindingConfig::default(),
+             copy_mode: BindingConfig::one("prefix+["),
+             focus_pane_left: BindingConfig::one("prefix+h"),
+diff --git a/src/input/keybind_help.rs b/src/input/keybind_help.rs
+index 80079488..f4bebee0 100644
+--- a/src/input/keybind_help.rs
++++ b/src/input/keybind_help.rs
+@@ -171,6 +171,13 @@ pub(crate) fn keybind_help_groups(
+                 entry(binding_label(&keybinds.close_pane), "close pane"),
+                 entry(binding_label(&keybinds.rename_pane), "rename pane"),
+                 entry(binding_label(&keybinds.edit_scrollback), "edit scrollback"),
++                entry(
++                    binding_label(&keybinds.previous_stop),
++                    "previous answer end",
++                ),
++                entry(binding_label(&keybinds.next_stop), "next answer end"),
++                entry(binding_label(&keybinds.previous_input), "previous message"),
++                entry(binding_label(&keybinds.next_input), "next message"),
+                 entry(binding_label(&keybinds.clear_pane), "clear pane"),
+                 entry(binding_label(&keybinds.copy_mode), "copy mode"),
+                 entry(binding_label(&keybinds.zoom), "zoom pane"),
+diff --git a/src/input/keybindings.rs b/src/input/keybindings.rs
+index 9ffce2ee..80830335 100644
+--- a/src/input/keybindings.rs
++++ b/src/input/keybindings.rs
+@@ -52,6 +52,11 @@ pub(crate) enum KeybindAction {
+     SplitHorizontal,
+     ClosePane,
+     EditScrollback,
++    // Fork: jump between agent turns in the scrollback.
++    PreviousStop,
++    NextStop,
++    PreviousInput,
++    NextInput,
+     ClearPane,
+     CopyMode,
+     Zoom,
+@@ -121,6 +126,10 @@ pub(crate) fn resolve_non_indexed_action(
+         (&keybinds.close_tab, KeybindAction::CloseTab),
+         (&keybinds.rename_pane, KeybindAction::RenamePane),
+         (&keybinds.edit_scrollback, KeybindAction::EditScrollback),
++        (&keybinds.previous_stop, KeybindAction::PreviousStop),
++        (&keybinds.next_stop, KeybindAction::NextStop),
++        (&keybinds.previous_input, KeybindAction::PreviousInput),
++        (&keybinds.next_input, KeybindAction::NextInput),
+         (&keybinds.clear_pane, KeybindAction::ClearPane),
+         (&keybinds.copy_mode, KeybindAction::CopyMode),
+         (&keybinds.focus_pane_left, KeybindAction::FocusPaneLeft),
+diff --git a/src/main.rs b/src/main.rs
+index 58ca2c06..47e9c75d 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -174,6 +174,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
+ # close_tab = "prefix+shift+x"
+ # rename_pane = "prefix+shift+p"
+ # edit_scrollback = "prefix+e"
++# Jump the pane's scrollback to where the agent's answers ended / your messages began.
++# previous_stop = "prefix+up"
++# next_stop = "prefix+down"
++# previous_input = "prefix+shift+up"
++# next_input = "prefix+shift+down"
+ # clear_pane = ""                  # unbound; e.g. "prefix+ctrl+k"
+ # focus_pane_left = "prefix+h"
+ # focus_pane_down = "prefix+j"
+diff --git a/src/pane.rs b/src/pane.rs
+index aa39a11f..2b224c1b 100644
+--- a/src/pane.rs
++++ b/src/pane.rs
+@@ -32,6 +32,8 @@ mod kitty_keyboard;
+ mod osc;
+ mod state;
+ mod terminal;
++// Fork: jump between agent turns in the scrollback.
++pub(crate) mod turn_marks;
+ mod xtgettcap;
+ 
+ use self::agent_detection::{
+@@ -3418,6 +3420,34 @@ impl PaneRuntime {
+         self.terminal.scroll_metrics()
+     }
+ 
++    /// Fork: keys were typed into the pane.
++    pub(crate) fn fork_note_typed(&self) {
++        self.terminal.fork_note_typed();
++    }
++
++    /// Fork: the agent went idle; `turn_end` when it had been working or waiting.
++    pub(crate) fn fork_mark_idle(&self, turn_end: bool) {
++        self.terminal.fork_mark_idle(turn_end);
++    }
++
++    /// Fork: the agent started working after being idle.
++    pub(crate) fn fork_mark_working(&self) {
++        self.terminal.fork_mark_working();
++    }
++
++    /// Fork: scroll to the previous or next turn end or message; false when none.
++    pub(crate) fn fork_scroll_to_mark(
++        &self,
++        kind: turn_marks::MarkKind,
++        direction: turn_marks::MarkDirection,
++    ) -> bool {
++        let moved = self.terminal.fork_scroll_to_mark(kind, direction);
++        if moved {
++            self.compression.wake();
++        }
++        moved
++    }
++
+     pub(crate) fn search_text_window(
+         &self,
+         query: &str,
+diff --git a/src/pane/terminal.rs b/src/pane/terminal.rs
+index d4b7ef57..d611a153 100644
+--- a/src/pane/terminal.rs
++++ b/src/pane/terminal.rs
+@@ -218,6 +218,8 @@ pub(crate) struct GhosttyPaneCore {
+     decscusr_tracker: DecscusrTracker,
+     cursor_settle_state: CursorPositionSettleState,
+     windows_powershell_prompt_cwd_reporting: bool,
++    /// Fork: where agent turns ended and the user's messages began.
++    fork_turn_marks: super::turn_marks::TurnMarks,
+ }
+ 
+ pub(crate) struct PaneTerminal {
+@@ -275,6 +277,30 @@ impl PaneTerminal {
+         self.ghostty.scroll_metrics()
+     }
+ 
++    /// Fork: keys were typed into the pane.
++    pub(crate) fn fork_note_typed(&self) {
++        self.ghostty.fork_note_typed();
++    }
++
++    /// Fork: the agent went idle; `turn_end` when it had been working or waiting.
++    pub(crate) fn fork_mark_idle(&self, turn_end: bool) {
++        self.ghostty.fork_mark_idle(turn_end);
++    }
++
++    /// Fork: the agent started working after being idle.
++    pub(crate) fn fork_mark_working(&self) {
++        self.ghostty.fork_mark_working();
++    }
++
++    /// Fork: scroll to the previous or next turn end or message; false when none.
++    pub(crate) fn fork_scroll_to_mark(
++        &self,
++        kind: super::turn_marks::MarkKind,
++        direction: super::turn_marks::MarkDirection,
++    ) -> bool {
++        self.ghostty.fork_scroll_to_mark(kind, direction)
++    }
++
+     pub(crate) fn search_text_window(
+         &self,
+         query: &str,
+@@ -1204,6 +1230,7 @@ impl GhosttyPaneTerminal {
+                 decscusr_tracker: DecscusrTracker::default(),
+                 cursor_settle_state: CursorPositionSettleState::default(),
+                 windows_powershell_prompt_cwd_reporting: false,
++                fork_turn_marks: Default::default(),
+             }),
+             key_encoder: Mutex::new(key_encoder),
+             pending_pty_responses,
+@@ -1830,6 +1857,44 @@ impl GhosttyPaneTerminal {
+         })
+     }
+ 
++    pub(crate) fn fork_note_typed(&self) {
++        if let Ok(mut core) = self.core.lock() {
++            core.fork_turn_marks.note_typed();
++        }
++    }
++
++    pub(crate) fn fork_mark_idle(&self, turn_end: bool) {
++        if let Ok(mut core) = self.core.lock() {
++            let core = &mut *core;
++            core.fork_turn_marks.mark_idle(&mut core.terminal, turn_end);
++        }
++    }
++
++    pub(crate) fn fork_mark_working(&self) {
++        if let Ok(mut core) = self.core.lock() {
++            core.fork_turn_marks.mark_working();
++        }
++    }
++
++    pub(crate) fn fork_scroll_to_mark(
++        &self,
++        kind: super::turn_marks::MarkKind,
++        direction: super::turn_marks::MarkDirection,
++    ) -> bool {
++        let Ok(mut core) = self.core.lock() else {
++            return false;
++        };
++        let core = &mut *core;
++        let Some(offset) = core
++            .fork_turn_marks
++            .offset_for(&core.terminal, kind, direction)
++        else {
++            return false;
++        };
++        ghostty_set_scroll_offset_from_bottom(&mut core.terminal, offset);
++        true
++    }
++
+     pub fn keyboard_protocol(&self) -> Option<crate::input::KeyboardProtocol> {
+         let Ok(core) = self.core.lock() else {
+             return None;
+diff --git a/src/pane/turn_marks.rs b/src/pane/turn_marks.rs
+new file mode 100644
+index 00000000..5d256865
+--- /dev/null
++++ b/src/pane/turn_marks.rs
+@@ -0,0 +1,408 @@
++//! Fork: marks in a pane's scrollback where an agent finished a turn and where the
++//! user's next message began, so the view can jump between them.
++
++use crate::ghostty::{ActiveScreen, CellWide, ScreenTextRow, Terminal, TrackedRow};
++
++/// Marks kept per pane; the oldest go first.
++const MAX_MARKS: usize = 2000;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum MarkKind {
++    /// Where the agent's answer ended.
++    TurnEnd,
++    /// Where one of the user's messages began.
++    Input,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum MarkDirection {
++    Previous,
++    Next,
++}
++
++struct TurnMark {
++    row: TrackedRow,
++    /// The agent went idle here after working or waiting (not on first detection).
++    turn_end: bool,
++    /// The user's next message was printed from here.
++    input: bool,
++}
++
++#[derive(Default)]
++pub(crate) struct TurnMarks {
++    marks: Vec<TurnMark>,
++    typed: bool,
++}
++
++impl TurnMarks {
++    /// Keys were typed into the pane.
++    pub(crate) fn note_typed(&mut self) {
++        self.typed = true;
++    }
++
++    /// The agent went idle. Marks the top of its prompt area: where its answer ended,
++    /// and where the user's next message will be printed.
++    pub(crate) fn mark_idle(&mut self, terminal: &mut Terminal, turn_end: bool) {
++        self.typed = false;
++        if !matches!(terminal.active_screen(), Ok(ActiveScreen::Primary)) {
++            return;
++        }
++        let Some(y) = prompt_area_top(terminal) else {
++            return;
++        };
++        if let Some(last) = self.marks.last_mut() {
++            if terminal.tracked_screen_row(&last.row) == Some(y) {
++                last.turn_end |= turn_end;
++                return;
++            }
++        }
++        let Some(row) = terminal.track_screen_row(y) else {
++            return;
++        };
++        self.marks.push(TurnMark {
++            row,
++            turn_end,
++            input: false,
++        });
++        if self.marks.len() > MAX_MARKS {
++            self.marks.remove(0);
++        }
++    }
++
++    /// The agent started working after being idle. If the user typed in between,
++    /// their message begins at the last mark.
++    pub(crate) fn mark_working(&mut self) {
++        if std::mem::take(&mut self.typed) {
++            if let Some(last) = self.marks.last_mut() {
++                last.input = true;
++            }
++        }
++    }
++
++    /// The scroll offset (rows from the bottom) showing the previous or next mark of
++    /// `kind`: a turn's end at the bottom of the view, a message's start at the top.
++    /// Next after the last mark is the live bottom; previous before the first is None.
++    pub(crate) fn offset_for(
++        &mut self,
++        terminal: &Terminal,
++        kind: MarkKind,
++        direction: MarkDirection,
++    ) -> Option<usize> {
++        self.marks
++            .retain(|mark| terminal.tracked_screen_row(&mark.row).is_some());
++        let scrollbar = terminal.scrollbar().ok()?;
++        let max = scrollbar.total.saturating_sub(scrollbar.len);
++        let current = max.saturating_sub(scrollbar.offset);
++        let newest = self.marks.len().saturating_sub(1);
++        let offsets = self
++            .marks
++            .iter()
++            .enumerate()
++            .filter(|(index, mark)| match kind {
++                // The newest turn's end sits right above the prompt until it's answered.
++                MarkKind::TurnEnd => mark.turn_end && (mark.input || *index != newest),
++                MarkKind::Input => mark.input,
++            })
++            .filter_map(|(_, mark)| terminal.tracked_screen_row(&mark.row))
++            .map(|row| {
++                let top = match kind {
++                    MarkKind::TurnEnd => (row + 1).saturating_sub(scrollbar.len),
++                    MarkKind::Input => row.saturating_sub(1),
++                };
++                max.saturating_sub(top)
++            });
++        match direction {
++            MarkDirection::Previous => offsets.filter(|&offset| offset > current).min(),
++            MarkDirection::Next => Some(
++                offsets
++                    .filter(|&offset| offset < current)
++                    .max()
++                    .unwrap_or(0),
++            ),
++        }
++    }
++}
++
++/// The first row of the agent's prompt area, counted from the top of the scrollback:
++/// Claude Code's rule above its `❯` prompt (or the top of its older prompt box), else
++/// the cursor's row.
++fn prompt_area_top(terminal: &Terminal) -> Option<usize> {
++    let total = terminal.total_rows().ok()?;
++    let active_top = total.saturating_sub(usize::from(terminal.rows().ok()?));
++    let lines = terminal
++        .screen_text_rows_range(active_top, total)
++        .ok()?
++        .iter()
++        .map(row_text)
++        .collect::<Vec<_>>();
++    let prompt = lines.iter().rposition(|line| {
++        let line = line.trim_start();
++        line.starts_with('❯') || line.starts_with("│ >")
++    });
++    let top = match prompt {
++        Some(prompt) if prompt > 0 && lines[prompt - 1].trim_start().starts_with(['─', '╭']) => {
++            prompt - 1
++        }
++        Some(prompt) => prompt,
++        None => usize::from(terminal.cursor_y().ok()?),
++    };
++    Some(active_top + top)
++}
++
++fn row_text(row: &ScreenTextRow) -> String {
++    row.cells
++        .iter()
++        .filter(|cell| !matches!(cell.wide, CellWide::SpacerTail | CellWide::SpacerHead))
++        .flat_map(|cell| {
++            let text = cell
++                .graphemes
++                .iter()
++                .filter_map(|&code| char::from_u32(code))
++                .collect::<Vec<_>>();
++            if text.is_empty() {
++                vec![' ']
++            } else {
++                text
++            }
++        })
++        .collect()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const COLS: u16 = 40;
++    const ROWS: u16 = 10;
++
++    fn terminal() -> Terminal {
++        Terminal::new(COLS, ROWS, 10_000_000).expect("terminal")
++    }
++
++    /// Prints `lines` of output, then a Claude-like prompt area at the bottom.
++    fn answer(terminal: &mut Terminal, label: &str, lines: usize) {
++        for line in 0..lines {
++            terminal.write(format!("{label} {line}\r\n").as_bytes());
++        }
++        prompt(terminal);
++    }
++
++    fn prompt(terminal: &mut Terminal) {
++        terminal.write("──────────\r\n❯ \r\n──────────\r\n  status".as_bytes());
++    }
++
++    /// Like Claude after a message is sent: replaces the prompt area with the message.
++    fn send(terminal: &mut Terminal, marks: &mut TurnMarks, message: &str) {
++        marks.note_typed();
++        // Back to the rule's row: cursor is on the status line, three rows below it.
++        terminal.write(b"\r\x1b[3A\x1b[J");
++        terminal.write(format!("> {message}\r\n").as_bytes());
++        marks.mark_working();
++    }
++
++    fn view_top(terminal: &Terminal) -> usize {
++        terminal.scrollbar().expect("scrollbar").offset
++    }
++
++    fn view_bottom(terminal: &Terminal) -> usize {
++        let scrollbar = terminal.scrollbar().expect("scrollbar");
++        scrollbar.offset + scrollbar.len - 1
++    }
++
++    fn row(terminal: &Terminal, y: usize) -> String {
++        row_text(&terminal.screen_text_rows_range(y, y + 1).expect("row")[0])
++            .trim_end()
++            .to_owned()
++    }
++
++    fn jump(
++        terminal: &mut Terminal,
++        marks: &mut TurnMarks,
++        kind: MarkKind,
++        direction: MarkDirection,
++    ) {
++        if let Some(offset) = marks.offset_for(terminal, kind, direction) {
++            let max = {
++                let scrollbar = terminal.scrollbar().expect("scrollbar");
++                scrollbar.total - scrollbar.len
++            };
++            if offset == 0 {
++                terminal.scroll_viewport_bottom();
++            } else {
++                terminal.scroll_viewport_row(max - offset.min(max));
++            }
++        }
++    }
++
++    /// Two finished turns and a third in progress, as a user would have them.
++    fn session(terminal: &mut Terminal, marks: &mut TurnMarks) {
++        terminal.write(b"welcome\r\n");
++        prompt(terminal);
++        marks.mark_idle(terminal, false);
++        send(terminal, marks, "first question");
++        answer(terminal, "one", 30);
++        marks.mark_idle(terminal, true);
++        send(terminal, marks, "second question");
++        answer(terminal, "two", 30);
++        marks.mark_idle(terminal, true);
++        send(terminal, marks, "third question");
++        for line in 0..30 {
++            terminal.write(format!("three {line}\r\n").as_bytes());
++        }
++    }
++
++    #[test]
++    fn previous_input_puts_each_message_at_the_top_of_the_view() {
++        let (mut terminal, mut marks) = (terminal(), TurnMarks::default());
++        session(&mut terminal, &mut marks);
++
++        jump(
++            &mut terminal,
++            &mut marks,
++            MarkKind::Input,
++            MarkDirection::Previous,
++        );
++        assert_eq!(row(&terminal, view_top(&terminal) + 1), "> third question");
++        jump(
++            &mut terminal,
++            &mut marks,
++            MarkKind::Input,
++            MarkDirection::Previous,
++        );
++        assert_eq!(row(&terminal, view_top(&terminal) + 1), "> second question");
++        jump(
++            &mut terminal,
++            &mut marks,
++            MarkKind::Input,
++            MarkDirection::Previous,
++        );
++        assert_eq!(row(&terminal, view_top(&terminal) + 1), "> first question");
++        let top = view_top(&terminal);
++        jump(
++            &mut terminal,
++            &mut marks,
++            MarkKind::Input,
++            MarkDirection::Previous,
++        );
++        assert_eq!(view_top(&terminal), top, "nothing before the first message");
++
++        jump(
++            &mut terminal,
++            &mut marks,
++            MarkKind::Input,
++            MarkDirection::Next,
++        );
++        assert_eq!(row(&terminal, view_top(&terminal) + 1), "> second question");
++    }
++
++    #[test]
++    fn previous_turn_end_puts_each_answer_end_at_the_bottom_of_the_view() {
++        let (mut terminal, mut marks) = (terminal(), TurnMarks::default());
++        session(&mut terminal, &mut marks);
++
++        jump(
++            &mut terminal,
++            &mut marks,
++            MarkKind::TurnEnd,
++            MarkDirection::Previous,
++        );
++        assert_eq!(row(&terminal, view_bottom(&terminal) - 1), "two 29");
++        assert_eq!(row(&terminal, view_bottom(&terminal)), "> third question");
++        jump(
++            &mut terminal,
++            &mut marks,
++            MarkKind::TurnEnd,
++            MarkDirection::Previous,
++        );
++        assert_eq!(row(&terminal, view_bottom(&terminal) - 1), "one 29");
++
++        jump(
++            &mut terminal,
++            &mut marks,
++            MarkKind::TurnEnd,
++            MarkDirection::Next,
++        );
++        assert_eq!(row(&terminal, view_bottom(&terminal) - 1), "two 29");
++        jump(
++            &mut terminal,
++            &mut marks,
++            MarkKind::TurnEnd,
++            MarkDirection::Next,
++        );
++        let scrollbar = terminal.scrollbar().expect("scrollbar");
++        assert_eq!(
++            scrollbar.offset + scrollbar.len,
++            scrollbar.total,
++            "back to live output"
++        );
++    }
++
++    #[test]
++    fn the_unanswered_turn_end_above_the_prompt_is_skipped() {
++        let (mut terminal, mut marks) = (terminal(), TurnMarks::default());
++        session(&mut terminal, &mut marks);
++        answer(&mut terminal, "end", 0);
++        marks.mark_idle(&mut terminal, true);
++
++        jump(
++            &mut terminal,
++            &mut marks,
++            MarkKind::TurnEnd,
++            MarkDirection::Previous,
++        );
++        assert_eq!(row(&terminal, view_bottom(&terminal) - 1), "two 29");
++    }
++
++    #[test]
++    fn going_working_without_typing_is_not_a_message() {
++        let (mut terminal, mut marks) = (terminal(), TurnMarks::default());
++        answer(&mut terminal, "one", 20);
++        marks.mark_idle(&mut terminal, true);
++        marks.mark_working();
++        answer(&mut terminal, "two", 20);
++        assert_eq!(
++            marks.offset_for(&terminal, MarkKind::Input, MarkDirection::Previous),
++            None
++        );
++    }
++
++    #[test]
++    fn marks_follow_their_rows_and_vanish_with_them() {
++        // About a page of scrollback, so old rows get pruned.
++        let mut terminal = Terminal::new(COLS, ROWS, 1_000_000).expect("terminal");
++        let mut marks = TurnMarks::default();
++        answer(&mut terminal, "one", 5);
++        marks.mark_idle(&mut terminal, true);
++        send(&mut terminal, &mut marks, "question");
++        answer(&mut terminal, "two", 20);
++        assert!(marks
++            .offset_for(&terminal, MarkKind::Input, MarkDirection::Previous)
++            .is_some());
++        // Far more output than the scrollback keeps.
++        for line in 0..50_000 {
++            terminal.write(format!("flood {line}\r\n").as_bytes());
++        }
++        assert_eq!(
++            marks.offset_for(&terminal, MarkKind::Input, MarkDirection::Previous),
++            None
++        );
++        assert!(marks.marks.is_empty());
++    }
++
++    #[test]
++    fn the_prompt_area_starts_at_the_rule_above_the_prompt() {
++        let mut terminal = terminal();
++        answer(&mut terminal, "one", 3);
++        let top = prompt_area_top(&terminal).expect("top");
++        assert_eq!(row(&terminal, top), "──────────");
++        assert_eq!(row(&terminal, top + 1), "❯");
++    }
++
++    #[test]
++    fn without_a_recognised_prompt_the_cursor_row_is_marked() {
++        let mut terminal = terminal();
++        terminal.write(b"$ ls\r\nfile\r\n$ ");
++        let top = prompt_area_top(&terminal).expect("top");
++        assert_eq!(row(&terminal, top), "$");
++    }
++}
+diff --git a/src/server/client_commands.rs b/src/server/client_commands.rs
+index 9eeae663..ecdc99d2 100644
+--- a/src/server/client_commands.rs
++++ b/src/server/client_commands.rs
+@@ -33,6 +33,8 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
+     "pane.rename",
+     "pane.resize",
+     "pane.scroll",
++    // Fork: keys jump between agent turns in the scrollback.
++    "pane.scroll_to_mark",
+     "pane.selection.read",
+     "pane.split",
+     "pane.swap",
+@@ -304,6 +306,10 @@ mod tests {
+             actual.remove("pane.move").as_deref(),
+             Some("eaed63cf205db2dc043ecce9e1a79cdca7f6e2521b364226bbf3121affadce7c")
+         );
++        assert_eq!(
++            actual.remove("pane.scroll_to_mark").as_deref(),
++            Some("0d686f2c97cc5a75c9446c52a1ad529fc4ebd947033a6d274b1e40e4348deda8")
++        );
+ 
+         assert_eq!(
+             actual, expected,
+diff --git a/src/server/headless.rs b/src/server/headless.rs
+index cb2c6196..2125d938 100644
+--- a/src/server/headless.rs
++++ b/src/server/headless.rs
+@@ -2448,6 +2448,8 @@ impl HeadlessServer {
+                 );
+                 let scroll_changed = runtime.scroll_metrics() != scroll_before;
+                 if keyboard_forwarded {
++                    // Fork: tells a turn's start from a working flicker for turn marks.
++                    runtime.fork_note_typed();
+                     self.note_interactive_input(runtime_pane_id, Instant::now());
+                 }
+                 if let Err(err) = input_result {
+diff --git a/src/server/headless/client_views.rs b/src/server/headless/client_views.rs
+index 31b39be2..58ce163d 100644
+--- a/src/server/headless/client_views.rs
++++ b/src/server/headless/client_views.rs
+@@ -262,6 +262,7 @@ impl HeadlessServer {
+                 | Method::PaneRename(_)
+                 | Method::PaneResize(_)
+                 | Method::PaneScroll(_)
++                | Method::PaneScrollToMark(_)
+                 | Method::PaneClear(_)
+                 | Method::PaneSplit(_)
+                 | Method::PaneSwap(_)
+diff --git a/src/terminal/runtime.rs b/src/terminal/runtime.rs
+index 23b61da2..dac05cd5 100644
+--- a/src/terminal/runtime.rs
++++ b/src/terminal/runtime.rs
+@@ -286,6 +286,30 @@ impl TerminalRuntime {
+         self.0.scroll_metrics()
+     }
+ 
++    /// Fork: keys were typed into the pane.
++    pub(crate) fn fork_note_typed(&self) {
++        self.0.fork_note_typed();
++    }
++
++    /// Fork: the agent went idle; `turn_end` when it had been working or waiting.
++    pub(crate) fn fork_mark_idle(&self, turn_end: bool) {
++        self.0.fork_mark_idle(turn_end);
++    }
++
++    /// Fork: the agent started working after being idle.
++    pub(crate) fn fork_mark_working(&self) {
++        self.0.fork_mark_working();
++    }
++
++    /// Fork: scroll to the previous or next turn end or message; false when none.
++    pub(crate) fn fork_scroll_to_mark(
++        &self,
++        kind: crate::pane::turn_marks::MarkKind,
++        direction: crate::pane::turn_marks::MarkDirection,
++    ) -> bool {
++        self.0.fork_scroll_to_mark(kind, direction)
++    }
++
+     pub(crate) fn search_text_window(
+         &self,
+         query: &str,
