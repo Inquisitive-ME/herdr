@@ -15,5 +15,6 @@ cargo test --locked "$@" --bin herdr -- \
     state_changes_record_when_the_state_began \
     handoff_keeps_the_start_of_a_redetected_state \
     fork_git_branch_is_read_once_per_folder_every_few_seconds \
-    fork_rebuild_of_the_same_version_is_an_update
+    fork_rebuild_of_the_same_version_is_an_update \
+    config::sidebar::tests::defaults_match_the_compact_agent_and_existing_space_layouts
 cargo test --locked "$@" --test cli -- fork_agent_list_filters_by_workspace

@@ -20,6 +20,10 @@ The patches in `patches/`:
    (`src/client/shell/space_agents.rs`) so upstream changes rarely conflict with it.
    - Each space in the sidebar lists its tabs underneath, and clicking one jumps to it.
      Working and blocked agents show how long they've been at it (`12m`, `3h`, `2d`).
+   - Spaces show just their name: the Git branch line upstream puts under it is off by
+     default (hovering an agent's line shows its branch). To bring it back, set
+     `rows = [["state_icon", "workspace"], ["branch", "git_status"]]` under
+     `[ui.sidebar.spaces]`.
    - Agent lines show `· N shells` when the agent is running shell commands. The count
      comes from the watcher in [`extras/shell-count`](extras/shell-count), which runs as
      a user service on the machine where herdr's server runs.

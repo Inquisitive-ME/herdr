@@ -10,11 +10,11 @@ Each space in the expanded sidebar (local and multi-machine) lists its
 tabs underneath: agents with their state, how long they have been
 working or waiting and "· N shells" from the pane's shells token (set
 by the shell-count watcher in the patch repo's extras); plain terminals
-dimmed and hideable per space; and where a pane works when that differs
-from its space. A space collapses to a status summary. Clicking a line
+dimmed and hideable per space. A space collapses to a status summary. Clicking a line
 focuses it on release, switching machines if needed; dragging moves the
 pane to another space or reorders tabs; its right-click menu renames,
-moves or closes.
+moves or closes. Spaces show only their name: the Git branch row is
+off by default (tests that render or poll it turn it on).
 
 The section under the spaces lists only agents waiting on the user:
 needing input first, then unread finished turns. It sits right under
@@ -29,6 +29,34 @@ local_agent_click_can_cancel_a_pending_remote_switch and
 switching_machines_preserves_aggregate_agent_scroll_and_visible_rows
 assert the old behavior and fail by design.
 
+diff --git a/src/app/git_refresh.rs b/src/app/git_refresh.rs
+index c2cd4bb5..c9248f62 100644
+--- a/src/app/git_refresh.rs
++++ b/src/app/git_refresh.rs
+@@ -728,7 +728,10 @@ mod tests {
+ 
+     #[test]
+     fn headless_deadline_can_suppress_git_refresh_timer() {
+-        let mut app = test_app(&crate::config::Config::default());
++        // Fork: Git polling follows the branch row, which is off by default.
++        let mut config = crate::config::Config::default();
++        config.ui.sidebar.spaces = crate::config::SpacesSidebarConfig::with_branch_row();
++        let mut app = test_app(&config);
+         app.state.workspaces.push(Workspace::test_new("test"));
+         let now = Instant::now();
+         app.last_git_remote_status_refresh = now - GIT_REMOTE_STATUS_REFRESH_INTERVAL;
+@@ -764,7 +767,10 @@ mod tests {
+ 
+     #[test]
+     fn git_refresh_due_request_survives_in_flight_refresh() {
+-        let mut app = test_app(&crate::config::Config::default());
++        // Fork: Git polling follows the branch row, which is off by default.
++        let mut config = crate::config::Config::default();
++        config.ui.sidebar.spaces = crate::config::SpacesSidebarConfig::with_branch_row();
++        let mut app = test_app(&config);
+         let now = Instant::now();
+         app.git_refresh_in_flight = true;
+ 
 diff --git a/src/client/mod.rs b/src/client/mod.rs
 index f55db195..5b16915a 100644
 --- a/src/client/mod.rs
@@ -2465,6 +2493,22 @@ index 5a732920..a52bca6d 100644
              tab_press: None,
              collapsed_groups: preferences.collapsed_groups.into_iter().collect(),
              remote_collapsed_groups,
+diff --git a/src/client/shell/tests/agents_worktrees_notifications.rs b/src/client/shell/tests/agents_worktrees_notifications.rs
+index df09f464..caa31887 100644
+--- a/src/client/shell/tests/agents_worktrees_notifications.rs
++++ b/src/client/shell/tests/agents_worktrees_notifications.rs
+@@ -91,7 +91,10 @@ fn collapsed_workspace_jitter_remains_a_click() {
+ 
+ #[test]
+ fn grouped_worktrees_render_parent_branch_and_indented_child() {
+-    let config = ClientShellConfig::from_config(&Config::default());
++    // Fork: the branch row is off by default.
++    let mut base = Config::default();
++    base.ui.sidebar.spaces = crate::config::SpacesSidebarConfig::with_branch_row();
++    let config = ClientShellConfig::from_config(&base);
+     let mut state = ClientShellState::new(config);
+     let mut snapshot = snapshot();
+     snapshot.workspaces[0].worktree = Some(ClientShellWorktree {
 diff --git a/src/client/shell/tests/mod.rs b/src/client/shell/tests/mod.rs
 index 05bfc263..d89023c4 100644
 --- a/src/client/shell/tests/mod.rs
@@ -2475,6 +2519,22 @@ index 05bfc263..d89023c4 100644
  mod popup_focus_projection;
 +mod space_tree;
  mod startup_overlays;
+diff --git a/src/client/shell/tests/popup_focus_projection.rs b/src/client/shell/tests/popup_focus_projection.rs
+index c9f02278..1089f698 100644
+--- a/src/client/shell/tests/popup_focus_projection.rs
++++ b/src/client/shell/tests/popup_focus_projection.rs
+@@ -149,7 +149,10 @@ fn non_overlay_ctrl_v_is_forwarded_to_the_focused_pane() {
+ 
+ #[test]
+ fn desktop_composition_keeps_shell_outside_origin_relative_surface() {
+-    let config = ClientShellConfig::from_config(&Config::default());
++    // Fork: the branch row is off by default.
++    let mut base = Config::default();
++    base.ui.sidebar.spaces = crate::config::SpacesSidebarConfig::with_branch_row();
++    let config = ClientShellConfig::from_config(&base);
+     let mut state = ClientShellState::new(config);
+     state.set_snapshot(Box::new(snapshot()));
+     state.set_pane_surface(surface());
 diff --git a/src/client/shell/tests/space_tree.rs b/src/client/shell/tests/space_tree.rs
 new file mode 100644
 index 00000000..01574926
@@ -2942,3 +3002,66 @@ index 00000000..01574926
 +        ]
 +    );
 +}
+diff --git a/src/config/sidebar.rs b/src/config/sidebar.rs
+index 9a4cb5e0..144daf08 100644
+--- a/src/config/sidebar.rs
++++ b/src/config/sidebar.rs
+@@ -465,12 +465,28 @@ pub struct SpacesSidebarConfig {
+ 
+ impl Default for SpacesSidebarConfig {
+     fn default() -> Self {
++        Self {
++            // Fork: spaces are topics with their tabs listed underneath, so only the name;
++            // the hover card shows an agent's branch.
++            rows: vec![vec![
++                SpaceSidebarToken::StateIcon,
++                SpaceSidebarToken::Workspace,
++            ]],
++            row_gap: DEFAULT_SIDEBAR_ROW_GAP,
++        }
++    }
++}
++
++#[cfg(test)]
++impl SpacesSidebarConfig {
++    /// Fork: upstream's default, with the Git branch line under the name.
++    pub(crate) fn with_branch_row() -> Self {
+         Self {
+             rows: vec![
+                 vec![SpaceSidebarToken::StateIcon, SpaceSidebarToken::Workspace],
+                 vec![SpaceSidebarToken::Branch, SpaceSidebarToken::GitStatus],
+             ],
+-            row_gap: DEFAULT_SIDEBAR_ROW_GAP,
++            ..Self::default()
+         }
+     }
+ }
+@@ -505,10 +521,10 @@ mod tests {
+         assert_eq!(config.agents.row_gap, 0);
+         assert_eq!(
+             config.spaces.rows,
+-            vec![
+-                vec![SpaceSidebarToken::StateIcon, SpaceSidebarToken::Workspace],
+-                vec![SpaceSidebarToken::Branch, SpaceSidebarToken::GitStatus],
+-            ]
++            vec![vec![
++                SpaceSidebarToken::StateIcon,
++                SpaceSidebarToken::Workspace
++            ]]
+         );
+         assert_eq!(config.spaces.row_gap, 0);
+     }
+diff --git a/src/main.rs b/src/main.rs
+index fa099f50..58ca2c06 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -363,7 +363,8 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
+ # [ui.sidebar.spaces]
+ # Blank rows between space entries. Set to 1 to restore the previous spacing.
+ # row_gap = 0
+-# rows = [["state_icon", "workspace"], ["branch", "git_status"]]
++# rows = [["state_icon", "workspace"]]
++# Add a ["branch", "git_status"] row to show the Git branch under the name.
+ 
+ # Background notification popup delivery
+ [ui.toast]
