@@ -67,6 +67,8 @@ jobs:
       GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
       # One target dir for Claude's builds and the verification build below.
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # The Zig packages build.yml saves, so an outage at codeberg.org doesn't block this.
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/zig-global-cache
     steps:
       - name: Check the tag
         shell: bash
@@ -107,6 +109,12 @@ jobs:
         with:
           key: fix-tree
           workspaces: upstream -> ../target
+      - name: Restore saved Zig packages
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: zig-global-cache/p
+          key: zig-packages-${{ hashFiles('upstream/vendor/libghostty-vt/build.zig.zon') }}
+          restore-keys: zig-packages-
       - name: Start the rebase
         working-directory: upstream
         shell: bash

@@ -43,6 +43,13 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Keep the saved Zig packages from expiring
+        # GitHub deletes caches nobody restored for 7 days; this runs daily.
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: zig-global-cache/p
+          key: zig-packages-
+          restore-keys: zig-packages-
       - name: Select stable upstream release and hash the queue
         id: plan
         env:
@@ -221,6 +228,9 @@ jobs:
     env:
       LIBGHOSTTY_VT_OPTIMIZE: ReleaseFast
       LIBGHOSTTY_VT_SIMD: 'true'
+      # Zig keeps the packages it downloads under p/ here; the job caches that folder
+      # so a build doesn't fail when one of their hosts (codeberg.org) is down.
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/zig-global-cache
       GIT_COMMITTER_NAME: github-actions[bot]
       GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
       UPSTREAM_TAG: ${{ needs.plan.outputs.upstream_tag }}
@@ -283,6 +293,12 @@ jobs:
         with:
           key: release-tree-${{ matrix.target }}
           workspaces: upstream -> target
+      - name: Cache Zig packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: zig-global-cache/p
+          key: zig-packages-${{ hashFiles('upstream/vendor/libghostty-vt/build.zig.zon') }}
+          restore-keys: zig-packages-
       - name: Remove Zig caches
         shell: bash
         run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
@@ -309,6 +325,7 @@ jobs:
       run:
         working-directory: upstream
     env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/zig-global-cache
       GIT_COMMITTER_NAME: github-actions[bot]
       GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
     steps:
@@ -349,6 +366,12 @@ jobs:
         with:
           key: test-tree
           workspaces: upstream -> target
+      - name: Cache Zig packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: zig-global-cache/p
+          key: zig-packages-${{ hashFiles('upstream/vendor/libghostty-vt/build.zig.zon') }}
+          restore-keys: zig-packages-
       - name: Run the fork's tests
         shell: bash
         run: ../queue/scripts/fork-tests.sh .
