@@ -2,15 +2,19 @@
 
 Shows how many background shells each agent is running in the patched sidebar, e.g.
 `● fridge prod 1 · 2 shells`, like Claude Code's own shell count. A Bash call Claude is
-waiting on looks the same from outside, but it always starts during the current
-working turn, so while an agent is working only shells older than the turn count; a
-background shell started mid-turn shows up once the turn ends. This uses the patched
-server's `state_since_ms` token; with an unpatched server every running shell counts.
-Commands younger than 3 seconds (hooks) are ignored.
+waiting on looks the same from outside, but it started during the current working turn
+and is at most 10 minutes old, the longest Claude Code waits on a command. So while an
+agent is working, a command counts once it's older than the turn or than 10 minutes; a
+background command started less than 10 minutes into a turn shows up late. This uses
+the patched server's `state_since_ms` token; with an unpatched server every running
+command counts. Commands younger than 3 seconds (hooks) are ignored.
 
 A small watcher runs as a user service. Every 3 seconds it asks herdr which process
-each agent pane runs, counts that process's child shells with `ps`, and stores the
-count in the pane's `shells` token. Counts expire within a minute if the watcher stops.
+each agent pane runs, counts that process's commands with `ps`, and stores the count
+in the pane's `shells` token. Commands are its child shells, and programs a background
+shell turned into with `exec` (a server started as `exec python serve.py`), which
+Claude Code still counts. Children the agent started itself at launch (MCP servers),
+`caffeinate` and its own helper processes don't count. Counts expire within a minute if the watcher stops.
 It needs Python 3 and works on Linux (systemd) and macOS (launchd).
 
 ```sh

@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Report how many shell commands each herdr agent is running.
 
-Every few seconds this asks herdr which process each agent pane runs, counts that
-process's direct child shells that have been alive for a few seconds, and stores the
-count in the pane's `shells` token. The patched herdr sidebar shows it as
-"· 2 shells". Linux and macOS.
+Every few seconds this asks herdr which process each agent pane runs, counts the
+commands that process is running (its child shells, and programs a shell turned into
+with exec) that have been alive for a few seconds, and stores the count in the pane's
+`shells` token. The patched herdr sidebar shows it as "· 2 shells". Linux and macOS.
 
 The count is meant to match Claude Code's background shells. A Bash call Claude is
-waiting on looks the same from outside, but it always starts during the current
-working turn, so while an agent is working only shells older than the turn count.
-That needs the patched server's `state_since_ms` agent token; without it every
-shell counts.
+waiting on looks the same from outside, but it started during the current working
+turn and is at most 10 minutes old (Claude Code's limit for waiting on a command). So
+while an agent works, a command counts once it's older than the turn or than 10
+minutes. That needs the patched server's `state_since_ms` agent token; without it
+every command counts.
 """
 import argparse
 import json
@@ -24,6 +25,9 @@ HERDR = os.environ.get("HERDR_BIN", "herdr")
 SOURCE = "shell-count"
 SHELLS = {"bash", "sh", "zsh", "dash", "fish"}
 REFRESH_SECONDS = 30  # re-report unchanged counts so the TTL below never expires
+FOREGROUND_LIMIT = 600  # Claude Code waits at most 10 minutes on a Bash command
+AT_LAUNCH = 30  # children started this soon after the agent are its own (MCP servers)
+AGENT_HELPERS = {"caffeinate"}  # Claude Code keeps the Mac awake while it works
 TTL_MS = 60_000  # counts vanish if this watcher stops
 
 
@@ -43,23 +47,41 @@ def parse_etime(text):
     return seconds + int(days or 0) * 86400
 
 
-def child_shells(min_age):
-    """{parent pid: ages in seconds of its shell children alive at least min_age}."""
+def processes():
+    """[(pid, parent pid, age in seconds, name)] for every process."""
     out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,etime=,comm="],
                          capture_output=True, text=True, timeout=10, check=True)
-    counts = {}
+    rows = []
     for line in out.stdout.splitlines():
         fields = line.split(None, 3)
         if len(fields) < 4:
             continue
-        _, ppid, etime, comm = fields
+        pid, ppid, etime, comm = fields
         name = os.path.basename(comm.strip()).lstrip("-")  # macOS gives paths, login shells "-zsh"
         try:
-            age = parse_etime(etime)
-            if name in SHELLS and age >= min_age:
-                counts.setdefault(int(ppid), []).append(age)
+            rows.append((int(pid), int(ppid), parse_etime(etime), name))
         except ValueError:
             continue
+    return rows
+
+
+def child_commands(rows, min_age):
+    """{parent pid: ages in seconds of the commands it runs, alive at least min_age}.
+
+    Commands are child shells, and other children started well after the parent: a
+    shell that execs a program keeps its process, so Claude Code still counts it.
+    Children started with the parent (MCP servers) and its helpers (caffeinate, its
+    own daemon, named like the parent) don't count.
+    """
+    parents = {pid: (age, name) for pid, _, age, name in rows}
+    counts = {}
+    for _, ppid, age, name in rows:
+        parent_age, parent_name = parents.get(ppid, (None, None))
+        if age < min_age or name in AGENT_HELPERS or name == parent_name:
+            continue
+        started_later = parent_age is not None and parent_age - age > AT_LAUNCH
+        if name in SHELLS or started_later:
+            counts.setdefault(ppid, []).append(age)
     return counts
 
 
@@ -79,7 +101,7 @@ def agent_pid(agent):
 
 
 def background_count(agent, ages, now_ms):
-    """Shells that aren't the command a working agent is waiting on."""
+    """Commands that aren't ones a working agent is waiting on."""
     since = (agent.get("tokens") or {}).get("state_since_ms")
     if agent.get("agent_status") != "working" or not since:
         return len(ages)
@@ -88,7 +110,7 @@ def background_count(agent, ages, now_ms):
     except ValueError:
         return len(ages)
     # One second of slack for ps rounding: a call made right as the turn began is foreground.
-    return sum(1 for age in ages if age > turn_seconds + 1)
+    return sum(1 for age in ages if age > min(turn_seconds, FOREGROUND_LIMIT) + 1)
 
 
 def report(pane_id, count, dry_run):
@@ -103,7 +125,7 @@ def report(pane_id, count, dry_run):
 
 def cycle(state, min_age, dry_run):
     agents = herdr_json("api", "snapshot")["snapshot"]["agents"]
-    shells = child_shells(min_age)
+    shells = child_commands(processes(), min_age)
     now = time.monotonic()
     for agent in agents:
         pane = agent["pane_id"]
