@@ -78,6 +78,25 @@ The patches in `patches/`:
    - Marks sit on Claude Code's prompt line; other agents get the cursor's row. Marks
      only exist for turns since the server started, and go away with their lines.
    - This changes the server: a running server needs the live handoff (below).
+7. **Your messages and Claude's replies marked on the scrollbar (server).** Each of your
+   messages gets a `◂` on its pane's scrollbar, on the row the thumb's top moves to when
+   the view shows the message; each thing Claude Code said to you (not its tool calls or
+   thinking) gets a quieter `◃`. Hovering a mark shows what is on that row in a card
+   (`#3/12  your message`, `●  Claude's reply`); clicking one outside the thumb scrolls
+   it to one row below the top, like `previous_input`. The thumb still drags as before.
+   - For Claude Code the server reads these from the scrollback as printed (a `❯` line
+     after a blank one; a `●` in the colour of your messages' text), so a resumed
+     session's history is marked too, and so is anything from before a server restart.
+     `previous_input` / `next_input` stop at the same messages. Replies only show once
+     the scrollback holds one of your messages, which tells their colour from a tool
+     call's.
+   - Other agents get a `◂` for each message patch 6 marked, and no reply marks.
+   - Needs pane scrollbars (`ui.pane_scrollbars`, on by default) and some scrollback.
+   - Nothing is marked while an agent uses the alternate screen (Claude Code's
+     fullscreen rendering): it keeps its own scrollback, and the scrollbar is hidden.
+   - `pane.mark.list` lists a pane's messages and replies with the row each starts on.
+   - This changes the server: a running server needs the live handoff (below). With an
+     older server there are just no marks.
 
 Builds: Linux x86_64, Linux ARM (aarch64) and Apple Silicon macOS. There are no
 Windows or Intel Mac builds; use upstream herdr there.

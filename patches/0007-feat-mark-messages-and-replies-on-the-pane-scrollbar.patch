@@ -1,0 +1,2138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Richard Swanson <rswanson05@gmail.com>
+Date: Sun, 22 Nov 2026 07:45:41 -0600
+Subject: [PATCH] feat: mark messages and replies on the pane scrollbar
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+pane.mark.list lists the messages in a pane's scrollback with the row
+each starts on. For Claude Code they are read from the scrollback as
+printed: a "❯" line after a blank row is one of the user's messages,
+and a "●" line in the colour of that text is one of its replies (a
+tool call's is coloured by how the call went). That covers a resumed
+session's history, and previous_input/next_input stop at the same
+messages. Other agents list the messages the server marked.
+
+The client asks for a shown agent pane's list when its agent changes
+state, when the pane changes width, and when the scrollback of an
+agent that isn't working changes length. It draws a mark in the
+scrollbar column on the row the thumb's top moves to when the view
+shows the message or reply. Hovering a mark lists what is on its row
+in a card; clicking one outside the thumb scrolls it one row below
+the top.
+
+A mark only counts as a message while it is still on the screen when
+the agent starts working: a resumed session printed its history over
+the mark made at startup, which then passed for the first message.
+
+diff --git a/crates/ghostty-vt/src/lib.rs b/crates/ghostty-vt/src/lib.rs
+index ce06cca6..b8fbd077 100644
+--- a/crates/ghostty-vt/src/lib.rs
++++ b/crates/ghostty-vt/src/lib.rs
+@@ -1308,6 +1308,19 @@ impl Terminal {
+         Ok((wide, graphemes))
+     }
+ 
++    /// Fork: a cell's style, counted from the top of the scrollback like `screen_cell`.
++    pub fn screen_cell_style(&self, x: u16, y: u32) -> Result<CellStyle, Error> {
++        let grid_ref = self.grid_ref(ghostty_screen_point(x, y))?;
++        let mut style = ffi::GhosttyStyle {
++            size: mem::size_of::<ffi::GhosttyStyle>(),
++            ..Default::default()
++        };
++        unsafe {
++            ffi::ghostty_grid_ref_style(&grid_ref, &mut style).into_result()?;
++        }
++        Ok(style.into())
++    }
++
+     pub fn screen_text_rows(&self) -> Result<Vec<ScreenTextRow>, Error> {
+         self.screen_text_rows_range(0, usize::MAX)
+     }
+diff --git a/docs/next/api/herdr-api.schema.json b/docs/next/api/herdr-api.schema.json
+index 7da94d0c..090d8c3f 100644
+--- a/docs/next/api/herdr-api.schema.json
++++ b/docs/next/api/herdr-api.schema.json
+@@ -5714,6 +5714,22 @@
+           ],
+           "type": "object"
+         },
++        {
++          "properties": {
++            "method": {
++              "const": "pane.mark.list",
++              "type": "string"
++            },
++            "params": {
++              "$ref": "#/schemas/request/$defs/PaneTarget"
++            }
++          },
++          "required": [
++            "method",
++            "params"
++          ],
++          "type": "object"
++        },
+         {
+           "properties": {
+             "method": {
+@@ -8197,6 +8213,44 @@
+           ],
+           "type": "object"
+         },
++        "PaneListedMark": {
++          "description": "Fork: a message in a pane's scrollback.",
++          "properties": {
++            "kind": {
++              "$ref": "#/schemas/success_response/$defs/PaneListedMarkKind"
++            },
++            "row": {
++              "description": "The message's first row, counted from the top of the pane's scrollback.",
++              "format": "uint64",
++              "minimum": 0,
++              "type": "integer"
++            },
++            "text": {
++              "description": "The message's first lines as printed.",
++              "type": "string"
++            }
++          },
++          "required": [
++            "kind",
++            "row",
++            "text"
++          ],
++          "type": "object"
++        },
++        "PaneListedMarkKind": {
++          "oneOf": [
++            {
++              "const": "input",
++              "description": "A message from the user.",
++              "type": "string"
++            },
++            {
++              "const": "reply",
++              "description": "Something the agent said to the user. Only listed for Claude Code.",
++              "type": "string"
++            }
++          ]
++        },
+         "PaneMoveReason": {
+           "enum": [
+             "same_tab",
+@@ -10326,6 +10380,26 @@
+               ],
+               "type": "object"
+             },
++            {
++              "description": "Fork: the messages in a pane's scrollback, oldest first: the ones Claude Code\nprinted, or for other agents the user messages the server marked.",
++              "properties": {
++                "marks": {
++                  "items": {
++                    "$ref": "#/schemas/success_response/$defs/PaneListedMark"
++                  },
++                  "type": "array"
++                },
++                "type": {
++                  "const": "pane_mark_list",
++                  "type": "string"
++                }
++              },
++              "required": [
++                "type",
++                "marks"
++              ],
++              "type": "object"
++            },
+             {
+               "properties": {
+                 "handled": {
+diff --git a/src/api/schema.rs b/src/api/schema.rs
+index d0313016..1472b0c3 100644
+--- a/src/api/schema.rs
++++ b/src/api/schema.rs
+@@ -169,6 +169,8 @@ pub enum Method {
+     PaneScroll(PaneScrollParams),
+     #[serde(rename = "pane.scroll_to_mark")]
+     PaneScrollToMark(PaneScrollToMarkParams),
++    #[serde(rename = "pane.mark.list")]
++    PaneMarkList(PaneTarget),
+     #[serde(rename = "pane.clear")]
+     PaneClear(PaneTarget),
+     #[serde(rename = "pane.edit_scrollback")]
+diff --git a/src/api/schema/panes.rs b/src/api/schema/panes.rs
+index 93eafe24..6674f953 100644
+--- a/src/api/schema/panes.rs
++++ b/src/api/schema/panes.rs
+@@ -265,6 +265,25 @@ pub enum PaneMarkDirection {
+     Next,
+ }
+ 
++/// Fork: a message in a pane's scrollback.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
++pub struct PaneListedMark {
++    pub kind: PaneListedMarkKind,
++    /// The message's first row, counted from the top of the pane's scrollback.
++    pub row: u64,
++    /// The message's first lines as printed.
++    pub text: String,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
++#[serde(rename_all = "snake_case")]
++pub enum PaneListedMarkKind {
++    /// A message from the user.
++    Input,
++    /// Something the agent said to the user. Only listed for Claude Code.
++    Reply,
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+ pub struct PaneTextPoint {
+     pub row: u32,
+diff --git a/src/api/schema/response.rs b/src/api/schema/response.rs
+index e92e4952..2b0db140 100644
+--- a/src/api/schema/response.rs
++++ b/src/api/schema/response.rs
+@@ -250,6 +250,11 @@ pub enum ResponseResult {
+     PaneLinkResolved {
+         regions: Vec<super::panes::PaneLinkRegion>,
+     },
++    /// Fork: the messages in a pane's scrollback, oldest first: the ones Claude Code
++    /// printed, or for other agents the user messages the server marked.
++    PaneMarkList {
++        marks: Vec<super::panes::PaneListedMark>,
++    },
+     PaneLinkActivated {
+         #[serde(default, skip_serializing_if = "Option::is_none")]
+         url: Option<String>,
+diff --git a/src/api/server.rs b/src/api/server.rs
+index 110a54d3..e3db72dc 100644
+--- a/src/api/server.rs
++++ b/src/api/server.rs
+@@ -665,6 +665,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
+         Method::PaneResize(_) => "pane.resize",
+         Method::PaneScroll(_) => "pane.scroll",
+         Method::PaneScrollToMark(_) => "pane.scroll_to_mark",
++        Method::PaneMarkList(_) => "pane.mark.list",
+         Method::PaneClear(_) => "pane.clear",
+         Method::PaneEditScrollback(_) => "pane.edit_scrollback",
+         Method::PaneSelectionRead(_) => "pane.selection.read",
+diff --git a/src/app/api.rs b/src/app/api.rs
+index 553cd27c..872238bf 100644
+--- a/src/app/api.rs
++++ b/src/app/api.rs
+@@ -1183,6 +1183,7 @@ impl App {
+             Method::PaneScrollToMark(params) => {
+                 return self.handle_pane_scroll_to_mark(request.id, params)
+             }
++            Method::PaneMarkList(target) => return self.handle_pane_mark_list(request.id, target),
+             Method::PaneClear(target) => return self.handle_pane_clear(request.id, target),
+             Method::PaneEditScrollback(target) => {
+                 return self.handle_pane_edit_scrollback(request.id, target);
+diff --git a/src/app/api/panes.rs b/src/app/api/panes.rs
+index 44661053..3cdf5fd8 100644
+--- a/src/app/api/panes.rs
++++ b/src/app/api/panes.rs
+@@ -235,6 +235,7 @@ impl App {
+                 PaneMarkDirection::Previous => MarkDirection::Previous,
+                 PaneMarkDirection::Next => MarkDirection::Next,
+             },
++            self.fork_pane_runs_claude(ws_idx, pane_id),
+         );
+         let Some(pane) = self.pane_info(ws_idx, pane_id) else {
+             return pane_not_found(id, &params.pane_id);
+@@ -242,6 +243,46 @@ impl App {
+         encode_success(id, ResponseResult::PaneInfo { pane })
+     }
+ 
++    /// Fork: whether the pane's agent is Claude Code, whose messages and replies can be
++    /// found in the scrollback as printed.
++    fn fork_pane_runs_claude(&self, ws_idx: usize, pane_id: PaneId) -> bool {
++        self.state
++            .workspaces
++            .get(ws_idx)
++            .and_then(|ws| ws.pane_state(pane_id))
++            .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
++            .and_then(|terminal| terminal.effective_agent_label())
++            == Some("claude")
++    }
++
++    /// Fork: the messages in a pane's scrollback.
++    pub(super) fn handle_pane_mark_list(&mut self, id: String, target: PaneTarget) -> String {
++        let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
++            return pane_not_found(id, &target.pane_id);
++        };
++        let Some(runtime) =
++            self.state
++                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
++        else {
++            return pane_not_found(id, &target.pane_id);
++        };
++        use crate::api::schema::{PaneListedMark, PaneListedMarkKind};
++        use crate::pane::turn_marks::ListedKind;
++        let marks = runtime
++            .fork_listed_marks(self.fork_pane_runs_claude(ws_idx, pane_id))
++            .into_iter()
++            .map(|mark| PaneListedMark {
++                kind: match mark.kind {
++                    ListedKind::Input => PaneListedMarkKind::Input,
++                    ListedKind::Reply => PaneListedMarkKind::Reply,
++                },
++                row: mark.row as u64,
++                text: mark.text,
++            })
++            .collect();
++        encode_success(id, ResponseResult::PaneMarkList { marks })
++    }
++
+     pub(super) fn handle_pane_edit_scrollback(&mut self, id: String, target: PaneTarget) -> String {
+         let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
+             return pane_not_found(id, &target.pane_id);
+diff --git a/src/client/mod.rs b/src/client/mod.rs
+index 5b16915a..84d178a3 100644
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -2309,6 +2309,8 @@ async fn run_client_loop(
+                     let (effects, outcome, frame) = {
+                         let shell = state.shell.as_mut().expect("checked shell mode");
+                         let mut outcome = shell.tick_selection_autoscroll(now);
++                        // Fork: list the messages marked on pane scrollbars.
++                        shell.tick_turn_marks(now, &mut outcome);
+                         for expired in expired_endpoints {
+                             if !shell.endpoint_is_active(&expired.endpoint_id) {
+                                 continue;
+diff --git a/src/client/shell.rs b/src/client/shell.rs
+index cfa8869c..af25e4e8 100644
+--- a/src/client/shell.rs
++++ b/src/client/shell.rs
+@@ -35,6 +35,7 @@ mod space_agents;
+ mod state;
+ mod surface_patch;
+ mod text_editor;
++mod turn_marks;
+ mod word_selection;
+ mod worktrees;
+ use text_editor::TextEditor;
+diff --git a/src/client/shell/actions.rs b/src/client/shell/actions.rs
+index 3c1a7e9f..800c2122 100644
+--- a/src/client/shell/actions.rs
++++ b/src/client/shell/actions.rs
+@@ -516,6 +516,10 @@ impl ClientShellState {
+         if let PendingEndpointKind::PaneLinkResolve { target } = pending.kind {
+             return self.complete_link_hover(target, result);
+         }
++        // Fork: optional like link hover, so a failure shows no notice.
++        if let PendingEndpointKind::PaneMarkList { pane_id, asked } = pending.kind {
++            return (self.complete_turn_marks(pane_id, asked, result), Vec::new());
++        }
+         if result.is_ok() {
+             let timeout_key = ClientEndpointNoticeKey {
+                 boot_id: boot_id.to_owned(),
+@@ -568,7 +572,8 @@ impl ClientShellState {
+         }
+         match pending.kind {
+             PendingEndpointKind::Generic => {}
+-            PendingEndpointKind::PaneLinkResolve { .. } => unreachable!("handled above"),
++            PendingEndpointKind::PaneLinkResolve { .. }
++            | PendingEndpointKind::PaneMarkList { .. } => unreachable!("handled above"),
+             PendingEndpointKind::ProductAnnouncementDismiss { version, id } => {
+                 return match result {
+                     Ok(_) => (false, Vec::new()),
+diff --git a/src/client/shell/composition.rs b/src/client/shell/composition.rs
+index c7782984..cc549e35 100644
+--- a/src/client/shell/composition.rs
++++ b/src/client/shell/composition.rs
+@@ -650,6 +650,9 @@ impl ClientShellState {
+             layout.tab_bar.union(layout.pane_surface)
+         };
+         self.render_hover_card(&mut frame, card_area, &mut occlusion);
++        // Fork: marks on pane scrollbars; where they are drawn is kept for clicks and patches.
++        self.turn_marks.drawn = self.turn_marks_to_draw(&frame);
++        self.render_turn_marks(&mut frame, &mut occlusion);
+         if let Some(overlay) = self.overlay.as_ref() {
+             let mut composed = frame.to_ratatui_buffer()?;
+             let cursor = if let ClientShellOverlay::ContextMenu(menu) = overlay {
+diff --git a/src/client/shell/mouse.rs b/src/client/shell/mouse.rs
+index fb0a19e8..73a86e97 100644
+--- a/src/client/shell/mouse.rs
++++ b/src/client/shell/mouse.rs
+@@ -683,6 +683,7 @@ impl ClientShellState {
+     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent, outcome: &mut ClientShellInput) {
+         self.update_link_hover(mouse, outcome);
+         self.update_sidebar_hover(mouse, outcome);
++        self.update_turn_mark_hover(mouse, outcome);
+         let point = (mouse.column, mouse.row);
+         if self.mode == ClientShellMode::Navigate
+             && self.workspace_preview_action_blocked()
+@@ -2207,7 +2208,10 @@ impl ClientShellState {
+                             last_sent_offset: None,
+                             last_sent_at: None,
+                         });
+-                    } else if let Some(offset) = Self::pane_scrollbar_offset(&hit, mouse.row, None)
++                    } else if let Some(offset) = self
++                        // Fork: a click on a message's mark scrolls to the message.
++                        .turn_mark_offset(&hit, mouse.row)
++                        .or_else(|| Self::pane_scrollbar_offset(&hit, mouse.row, None))
+                     {
+                         self.push_pane_scroll_offset(hit.pane_id, offset, outcome);
+                     }
+diff --git a/src/client/shell/state.rs b/src/client/shell/state.rs
+index 5b22e33f..e2e9bf6a 100644
+--- a/src/client/shell/state.rs
++++ b/src/client/shell/state.rs
+@@ -671,6 +671,11 @@ pub(super) enum PendingEndpointKind {
+     PaneLinkResolve {
+         target: super::link_hover::LinkHoverTarget,
+     },
++    /// Fork: the user's messages marked on a pane's scrollbar.
++    PaneMarkList {
++        pane_id: String,
++        asked: super::turn_marks::TurnMarksAsk,
++    },
+     PaneLinkActivate {
+         pane_id: String,
+         inner_rect: Rect,
+@@ -897,6 +902,8 @@ pub(crate) struct ClientShellState {
+     pub(super) workspace_press: Option<ClientWorkspacePress>,
+     /// Fork: space tree press, drag and clock state.
+     pub(super) space_tree: space_agents::SpaceTreeState,
++    /// Fork: the user's messages marked on pane scrollbars.
++    pub(super) turn_marks: turn_marks::TurnMarksState,
+     pub(super) tab_press: Option<ClientTabPress>,
+     pub(super) collapsed_groups: HashSet<String>,
+     pub(super) remote_collapsed_groups: HashMap<ClientEndpointId, HashSet<String>>,
+@@ -1072,6 +1079,7 @@ impl ClientShellState {
+             chrome_drag: None,
+             workspace_press: None,
+             space_tree: Default::default(),
++            turn_marks: Default::default(),
+             tab_press: None,
+             collapsed_groups: preferences.collapsed_groups.into_iter().collect(),
+             remote_collapsed_groups,
+diff --git a/src/client/shell/surface_patch.rs b/src/client/shell/surface_patch.rs
+index 6c829acf..9892ef7a 100644
+--- a/src/client/shell/surface_patch.rs
++++ b/src/client/shell/surface_patch.rs
+@@ -74,6 +74,8 @@ fn fast_path_blocker(
+         Some("client_surface_patch.fallback.copy_feedback")
+     } else if state.link_hover_blocks_patch(patch) {
+         Some("client_surface_patch.fallback.link_hover")
++    } else if state.turn_marks_block_patch() {
++        Some("client_surface_patch.fallback.turn_marks")
+     } else if state.selection.is_some() {
+         Some("client_surface_patch.fallback.selection")
+     } else if state.copy_mode.is_some() {
+@@ -176,6 +178,8 @@ impl ClientShellState {
+             let (cols, rows) = self.last_composed_size.unwrap_or_default();
+             self.layout(cols, rows).pane_surface
+         });
++        // Fork: the scrollbar cells a patch redraws keep their marks.
++        let over_marks = |patch| self.turn_marks_over_patch(patch);
+         let composed_patch = fast_path_area.map(|area| ClientComposedSurfacePatch {
+             rows: patch
+                 .rows
+@@ -196,6 +200,7 @@ impl ClientShellState {
+                     shape: cursor.shape,
+                 }),
+         });
++        let composed_patch = composed_patch.map(over_marks);
+         if let Some(area) = fast_path_area {
+             let applied = self
+                 .pane_surface
+diff --git a/src/client/shell/tests/mod.rs b/src/client/shell/tests/mod.rs
+index d89023c4..6da6dd14 100644
+--- a/src/client/shell/tests/mod.rs
++++ b/src/client/shell/tests/mod.rs
+@@ -263,3 +263,4 @@ mod mouse_selection;
+ mod popup_focus_projection;
+ mod space_tree;
+ mod startup_overlays;
++mod turn_marks;
+diff --git a/src/client/shell/tests/turn_marks.rs b/src/client/shell/tests/turn_marks.rs
+new file mode 100644
+index 00000000..149148b6
+--- /dev/null
++++ b/src/client/shell/tests/turn_marks.rs
+@@ -0,0 +1,469 @@
++//! Fork: marks of the user's messages and the agent's replies on pane scrollbars.
++
++use std::time::{Duration, Instant};
++
++use super::super::turn_marks::{MESSAGE_GLYPH, REPLY_GLYPH};
++use super::*;
++use crate::api::schema::{Method, PaneListedMark, PaneListedMarkKind, ResponseResult};
++
++const WIDTH: u16 = 40;
++const TRACK: u16 = 10;
++
++fn agent_snapshot(state_change_seq: u64, agent_status: AgentStatus) -> Box<ClientShellSnapshot> {
++    let mut snapshot = snapshot();
++    snapshot.agents.push(ClientShellAgent {
++        pane_id: "pane_1".into(),
++        workspace_id: "ws_1".into(),
++        tab_id: "tab_1".into(),
++        name: None,
++        display_agent: None,
++        agent: Some("claude".into()),
++        title: None,
++        terminal_title: None,
++        terminal_title_stripped: None,
++        agent_status,
++        state_change_seq,
++        state_labels: Vec::new(),
++        tokens: Vec::new(),
++        focused: true,
++    });
++    Box::new(snapshot)
++}
++
++/// A 40x10 pane with `max` rows of scrollback above it, scrolled `offset` rows up.
++fn scrolled_surface(max: u64, offset: u64) -> PaneSurfaceFrame {
++    let mut surface = surface();
++    surface.frame = FrameData::from_ratatui_buffer_with_hyperlinks(
++        &Buffer::empty(Rect::new(0, 0, WIDTH, TRACK)),
++        None,
++        &[],
++    );
++    let pane = &mut surface.panes[0];
++    pane.rect = SurfaceRect {
++        x: 0,
++        y: 0,
++        width: WIDTH,
++        height: TRACK,
++    };
++    pane.inner_rect = SurfaceRect {
++        width: WIDTH - 1,
++        ..pane.rect
++    };
++    pane.scrollbar_rect = Some(SurfaceRect {
++        x: WIDTH - 1,
++        width: 1,
++        ..pane.rect
++    });
++    pane.scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
++        offset_from_bottom: offset,
++        max_offset_from_bottom: max,
++        viewport_rows: u64::from(TRACK),
++    });
++    surface
++}
++
++/// A pane at the bottom of 100 rows, so each of its ten scrollbar rows stands for ten,
++/// whose agent is in `agent_status`.
++fn marks_state_with(agent_status: AgentStatus) -> ClientShellState {
++    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
++    state.set_snapshot(agent_snapshot(1, agent_status));
++    state.set_endpoint_methods(Some(vec![
++        "pane.focus".into(),
++        "pane.mark.list".into(),
++        "pane.scroll".into(),
++    ]));
++    state.set_pane_surface(scrolled_surface(90, 0));
++    state.compose(106, 20).expect("composed frame");
++    state
++}
++
++fn marks_state() -> ClientShellState {
++    marks_state_with(AgentStatus::Working)
++}
++
++fn tick_at(state: &mut ClientShellState, now: Instant) -> ClientShellInput {
++    let mut outcome = ClientShellInput::default();
++    state.tick_turn_marks(now, &mut outcome);
++    outcome
++}
++
++fn tick(state: &mut ClientShellState) -> ClientShellInput {
++    tick_at(state, Instant::now())
++}
++
++/// The id of the one `pane.mark.list` request in `outcome`.
++fn list_request(outcome: &ClientShellInput) -> String {
++    let [ClientShellAction::Endpoint { request, .. }] = &outcome.actions[..] else {
++        panic!("expected one request, got {}", outcome.actions.len());
++    };
++    assert!(matches!(
++        &request.method,
++        Method::PaneMarkList(target) if target.pane_id == "pane_1"
++    ));
++    request.id.clone()
++}
++
++fn message(row: u64, text: &str) -> PaneListedMark {
++    PaneListedMark {
++        kind: PaneListedMarkKind::Input,
++        row,
++        text: text.into(),
++    }
++}
++
++fn reply(row: u64, text: &str) -> PaneListedMark {
++    PaneListedMark {
++        kind: PaneListedMarkKind::Reply,
++        ..message(row, text)
++    }
++}
++
++/// Ask for the pane's list at `now` and answer with `marks`; whether that asks for a repaint.
++fn list_marks_at(state: &mut ClientShellState, now: Instant, marks: Vec<PaneListedMark>) -> bool {
++    let id = list_request(&tick_at(state, now));
++    let (repaint, actions) =
++        state.handle_endpoint_result("boot-1", &id, Ok(ResponseResult::PaneMarkList { marks }));
++    assert!(actions.is_empty());
++    repaint
++}
++
++/// Messages on scrollback rows 21 and 23 (both on scrollbar row 2), 61 (row 6) and, in
++/// the last screen, 95 (row 9, where the thumb is), listed and drawn.
++fn four_messages(state: &mut ClientShellState) {
++    let marks = vec![
++        message(21, "first question"),
++        message(23, "second question"),
++        message(61, "third question"),
++        message(95, "newest question"),
++    ];
++    assert!(list_marks_at(state, Instant::now(), marks));
++    state.compose(106, 20).expect("composed frame");
++}
++
++fn track(state: &ClientShellState) -> Rect {
++    state.hits.panes[0].scrollbar_rect.expect("scrollbar track")
++}
++
++fn on_track(state: &ClientShellState, kind: MouseEventKind, row: u16) -> RawInputEvent {
++    let track = track(state);
++    RawInputEvent::Mouse(MouseEvent {
++        kind,
++        column: track.x,
++        row: track.y + row,
++        modifiers: KeyModifiers::empty(),
++    })
++}
++
++fn track_cell(state: &ClientShellState, frame: &FrameData, row: u16) -> crate::protocol::CellData {
++    let track = track(state);
++    frame.cells[usize::from(track.y + row) * usize::from(frame.width) + usize::from(track.x)]
++        .clone()
++}
++
++fn color(color: ratatui::style::Color) -> u32 {
++    crate::protocol::color_to_u32(color)
++}
++
++fn scroll_offset(outcome: &ClientShellInput) -> Option<u64> {
++    outcome.actions.iter().find_map(|action| match action {
++        ClientShellAction::Endpoint { request, .. } => match &request.method {
++            Method::PaneScroll(params) => Some(params.offset_from_bottom),
++            _ => None,
++        },
++        _ => None,
++    })
++}
++
++#[test]
++fn a_shown_agent_pane_is_asked_for_its_messages_when_its_agent_changes_state() {
++    let mut state = marks_state();
++    let id = list_request(&tick(&mut state));
++    assert!(tick(&mut state).actions.is_empty(), "already asked");
++
++    state.handle_endpoint_result(
++        "boot-1",
++        &id,
++        Ok(ResponseResult::PaneMarkList { marks: Vec::new() }),
++    );
++    assert!(tick(&mut state).actions.is_empty(), "listed for this state");
++
++    // The agent went idle or started working: the server may have added a mark.
++    state.set_snapshot(agent_snapshot(2, AgentStatus::Working));
++    state.set_pane_surface(scrolled_surface(90, 0));
++    state.compose(106, 20).expect("composed frame");
++    list_request(&tick(&mut state));
++}
++
++#[test]
++fn an_agent_that_is_not_working_is_asked_again_when_its_scrollback_changes_length() {
++    // A resumed session prints its history while its agent stays idle.
++    let mut state = marks_state_with(AgentStatus::Idle);
++    let listed = Instant::now();
++    list_marks_at(&mut state, listed, Vec::new());
++    state.set_pane_surface(scrolled_surface(400, 0));
++    state.compose(106, 20).expect("composed frame");
++
++    let soon = listed + Duration::from_millis(500);
++    assert!(tick_at(&mut state, soon).actions.is_empty(), "too soon");
++    list_request(&tick_at(&mut state, listed + Duration::from_millis(1100)));
++
++    // A working agent's output is listed when its turn ends.
++    let mut state = marks_state();
++    list_marks_at(&mut state, listed, Vec::new());
++    state.set_pane_surface(scrolled_surface(400, 0));
++    state.compose(106, 20).expect("composed frame");
++    let later = listed + Duration::from_secs(5);
++    assert!(tick_at(&mut state, later).actions.is_empty());
++}
++
++#[test]
++fn a_pane_without_an_agent_or_a_server_without_the_method_is_not_asked() {
++    let mut state = marks_state();
++    state.set_endpoint_methods(Some(vec!["pane.scroll".into()]));
++    assert!(tick(&mut state).actions.is_empty());
++    state.set_endpoint_methods(None);
++    assert!(tick(&mut state).actions.is_empty());
++
++    let mut state = marks_state();
++    state.set_snapshot(Box::new(snapshot()));
++    state.set_pane_surface(scrolled_surface(90, 0));
++    state.compose(106, 20).expect("composed frame");
++    assert!(tick(&mut state).actions.is_empty());
++}
++
++#[test]
++fn a_failed_list_shows_no_notice_and_is_not_asked_again() {
++    let mut state = marks_state();
++    let id = list_request(&tick(&mut state));
++    let (repaint, actions) = state.handle_endpoint_result(
++        "boot-1",
++        &id,
++        Err(ClientShellEndpointError {
++            code: Some("endpoint_timeout".into()),
++            message: "timed out".into(),
++        }),
++    );
++    assert!(!repaint && actions.is_empty());
++    assert!(state.visible_endpoint_notice.is_none());
++    assert!(tick(&mut state).actions.is_empty());
++}
++
++#[test]
++fn marks_are_drawn_on_the_scrollbar_rows_the_thumb_moves_to() {
++    let mut state = marks_state();
++    four_messages(&mut state);
++    let frame = state.compose(106, 20).expect("composed frame");
++
++    let marked = (0..TRACK)
++        .filter(|row| track_cell(&state, &frame, *row).symbol == MESSAGE_GLYPH)
++        .collect::<Vec<_>>();
++    assert_eq!(marked, [2, 6, 9]);
++    assert_eq!(
++        track_cell(&state, &frame, 2).fg,
++        color(state.config.palette.accent)
++    );
++
++    // Scrolled to the third message, the thumb's top is on its mark.
++    let metrics = crate::pane::ScrollMetrics {
++        offset_from_bottom: 30,
++        max_offset_from_bottom: 90,
++        viewport_rows: usize::from(TRACK),
++    };
++    let thumb = crate::ui::scrollbar_thumb(metrics, track(&state)).expect("thumb");
++    assert_eq!(thumb.top, track(&state).y + 6);
++}
++
++#[test]
++fn a_reply_gets_a_quieter_mark_that_a_message_on_the_same_row_covers() {
++    let mut state = marks_state();
++    let marks = vec![
++        message(21, "a question"),
++        reply(23, "It works like this."),
++        reply(61, "And one more thing."),
++    ];
++    assert!(list_marks_at(&mut state, Instant::now(), marks));
++    let frame = state.compose(106, 20).expect("composed frame");
++
++    let (shared, alone) = (track_cell(&state, &frame, 2), track_cell(&state, &frame, 6));
++    assert_eq!(shared.symbol, MESSAGE_GLYPH);
++    assert_eq!(alone.symbol, REPLY_GLYPH);
++    assert_eq!(alone.fg, color(state.config.palette.overlay1));
++
++    let click = on_track(&state, MouseEventKind::Down(MouseButton::Left), 6);
++    assert_eq!(
++        scroll_offset(&state.handle_raw_events(vec![click])),
++        Some(30)
++    );
++}
++
++#[test]
++fn a_click_on_a_mark_scrolls_its_oldest_message_one_row_below_the_top() {
++    let mut state = marks_state();
++    four_messages(&mut state);
++    let click = on_track(&state, MouseEventKind::Down(MouseButton::Left), 6);
++    assert_eq!(
++        scroll_offset(&state.handle_raw_events(vec![click])),
++        Some(30)
++    );
++
++    let mut state = marks_state();
++    four_messages(&mut state);
++    let click = on_track(&state, MouseEventKind::Down(MouseButton::Left), 2);
++    assert_eq!(
++        scroll_offset(&state.handle_raw_events(vec![click])),
++        Some(70)
++    );
++}
++
++#[test]
++fn clicks_off_the_marks_and_on_the_thumb_work_as_before() {
++    let mut state = marks_state();
++    four_messages(&mut state);
++    let (track, metrics) = (track(&state), state.hits.panes[0].scroll.expect("metrics"));
++    let click = on_track(&state, MouseEventKind::Down(MouseButton::Left), 4);
++    assert_eq!(
++        scroll_offset(&state.handle_raw_events(vec![click])),
++        Some(crate::ui::scrollbar_offset_from_row(metrics, track, track.y + 4) as u64)
++    );
++
++    // The newest message's mark is under the thumb: the click grabs the thumb.
++    let mut state = marks_state();
++    four_messages(&mut state);
++    let click = on_track(&state, MouseEventKind::Down(MouseButton::Left), 9);
++    assert_eq!(scroll_offset(&state.handle_raw_events(vec![click])), None);
++    assert!(matches!(
++        state.chrome_drag,
++        Some(ClientChromeDrag::PaneScrollbar { .. })
++    ));
++}
++
++#[test]
++fn hovering_a_mark_lists_what_is_on_its_row_in_a_card_and_lights_the_mark() {
++    let mut state = marks_state();
++    let marks = vec![
++        message(21, "first question"),
++        reply(23, "It works like this."),
++        message(61, "third question"),
++    ];
++    assert!(list_marks_at(&mut state, Instant::now(), marks));
++    state.compose(106, 20).expect("composed frame");
++
++    let moved = on_track(&state, MouseEventKind::Moved, 2);
++    assert!(state.handle_raw_events(vec![moved]).repaint);
++    let frame = state.compose(106, 20).expect("composed frame");
++    let rows = frame_rows(&frame);
++    assert!(rows.iter().any(|row| row.contains("#1/2  first question")));
++    assert!(rows
++        .iter()
++        .any(|row| row.contains("●     It works like this.")));
++    assert!(!rows.iter().any(|row| row.contains("third question")));
++    assert_eq!(
++        track_cell(&state, &frame, 2).fg,
++        color(state.config.palette.text)
++    );
++
++    let moved = on_track(&state, MouseEventKind::Moved, 4);
++    assert!(state.handle_raw_events(vec![moved]).repaint);
++    let frame = state.compose(106, 20).expect("composed frame");
++    assert!(!frame_rows(&frame)
++        .iter()
++        .any(|row| row.contains("first question")));
++}
++
++/// A patch of the pane's first row that also reports `max` rows of scrollback scrolled
++/// `offset` up, and redraws the scrollbar cell on row `scrollbar` when given.
++fn patch(max: u64, offset: u64, scrollbar: Option<u16>) -> crate::protocol::PaneSurfacePatch {
++    let cell = |symbol: &str| crate::protocol::CellData {
++        symbol: symbol.into(),
++        fg: 0,
++        bg: 0,
++        modifier: 0,
++        skip: false,
++        hyperlink: None,
++    };
++    let mut rows = vec![crate::protocol::PaneSurfacePatchRow {
++        x: 0,
++        y: 0,
++        cells: vec![cell("x")],
++    }];
++    if let Some(y) = scrollbar {
++        rows.push(crate::protocol::PaneSurfacePatchRow {
++            x: WIDTH - 1,
++            y,
++            cells: vec![cell("▐")],
++        });
++    }
++    crate::protocol::PaneSurfacePatch {
++        boot_id: "boot-1".into(),
++        projection_revision: 1,
++        base_surface_revision: 1,
++        surface_revision: 2,
++        rows,
++        panes: vec![scrolled_surface(max, offset).panes.remove(0)],
++        cursor: None,
++    }
++}
++
++/// The patch as applied to the composed frame, when it could be applied in place.
++fn in_place(
++    state: &mut ClientShellState,
++    patch: crate::protocol::PaneSurfacePatch,
++) -> Option<ClientComposedSurfacePatch> {
++    match state.apply_pane_surface_patch(patch) {
++        ClientPaneSurfacePatchOutcome::Applied(composed) => composed,
++        ClientPaneSurfacePatchOutcome::Rejected => panic!("patch rejected"),
++    }
++}
++
++#[test]
++fn a_patch_applied_in_place_keeps_the_marks_on_the_scrollbar_cells_it_redraws() {
++    let mut state = marks_state();
++    four_messages(&mut state);
++    let track = track(&state);
++
++    // The thumb moved onto the marked row 2 and the unmarked row 3.
++    let mut thumb = patch(90, 70, Some(2));
++    thumb.rows.push(crate::protocol::PaneSurfacePatchRow {
++        y: 3,
++        ..thumb.rows[1].clone()
++    });
++    let composed = in_place(&mut state, thumb).expect("applied in place");
++    let symbol = |row: u16| {
++        composed
++            .rows
++            .iter()
++            .find(|patched| patched.x == track.x && patched.y == track.y + row)
++            .map(|patched| patched.cells[0].symbol.clone())
++    };
++    assert_eq!(symbol(2).as_deref(), Some(MESSAGE_GLYPH));
++    assert_eq!(symbol(3).as_deref(), Some("▐"));
++}
++
++#[test]
++fn marks_that_new_output_moved_are_redrawn_at_the_next_tick() {
++    let mut state = marks_state();
++    four_messages(&mut state);
++    assert!(!tick(&mut state).repaint);
++
++    // One more row of output leaves every mark on its row.
++    assert!(in_place(&mut state, patch(91, 0, None)).is_some());
++    assert!(!tick(&mut state).repaint);
++
++    // Twice the scrollback: the third message's mark belongs further up.
++    let mut state = marks_state();
++    four_messages(&mut state);
++    assert!(in_place(&mut state, patch(190, 0, None)).is_some());
++    assert!(tick(&mut state).repaint);
++    state.compose(106, 20).expect("composed frame");
++    assert!(!tick(&mut state).repaint);
++}
++
++#[test]
++fn a_patch_under_a_card_recomposes() {
++    let mut state = marks_state();
++    four_messages(&mut state);
++    let moved = on_track(&state, MouseEventKind::Moved, 2);
++    state.handle_raw_events(vec![moved]);
++    state.compose(106, 20).expect("composed frame");
++    assert!(in_place(&mut state, patch(91, 0, None)).is_none());
++}
+diff --git a/src/client/shell/turn_marks.rs b/src/client/shell/turn_marks.rs
+new file mode 100644
+index 00000000..10aa55a1
+--- /dev/null
++++ b/src/client/shell/turn_marks.rs
+@@ -0,0 +1,472 @@
++//! Fork: marks on a pane's scrollbar where the user's messages to its agent began and,
++//! for Claude Code, where its replies did. Hovering a mark shows what is there; clicking
++//! one outside the thumb scrolls it to one row below the top of the view, like
++//! `previous_input`.
++//!
++//! The server lists the messages (`pane.mark.list`). A pane's list is fetched again when
++//! its agent changes state, when the pane is rewrapped, and when the scrollback of an
++//! agent that isn't working changes length (a resumed session printing its history).
++//!
++//! Lives in its own file so upstream changes rarely conflict with it.
++
++use std::time::{Duration, Instant};
++
++use ratatui::{
++    text::{Line, Span},
++    widgets::{Block, BorderType, Clear, Paragraph, Widget},
++};
++
++use super::*;
++use crate::api::schema::{AgentStatus, PaneListedMarkKind};
++use crate::pane::ScrollMetrics;
++use crossterm::event::MouseEvent;
++
++/// Drawn in the scrollbar's column, on the row the thumb's top moves to when the view
++/// shows the message or the reply. A message's mark covers a reply's on the same row.
++pub(super) const MESSAGE_GLYPH: &str = "◂";
++pub(super) const REPLY_GLYPH: &str = "◃";
++
++/// Stands where a message's number would in a card's line for a reply.
++const REPLY_LABEL: &str = "●";
++
++/// The most lines a card lists, and the widest their text is drawn.
++const CARD_ROWS: usize = 5;
++const CARD_TEXT_WIDTH: usize = 60;
++
++/// The least time between two lists asked only because the scrollback changed length.
++const RELIST_INTERVAL: Duration = Duration::from_secs(1);
++
++/// What a pane's list was asked for.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) struct TurnMarksAsk {
++    state_change_seq: u64,
++    width: u16,
++    /// The pane's largest scroll offset, which follows the length of its scrollback.
++    extent: usize,
++    at: Instant,
++}
++
++#[derive(Debug, PartialEq, Eq)]
++struct ListedMark {
++    reply: bool,
++    /// Its first row, counted from the top of the scrollback.
++    row: usize,
++    text: String,
++}
++
++struct PaneTurnMarks {
++    asked: TurnMarksAsk,
++    marks: Vec<ListedMark>,
++}
++
++/// Where a pane's marks were last drawn. Clicks, hovering and patches go by this, so they
++/// agree with what is on the screen until the next full frame.
++pub(super) struct DrawnMarks {
++    track: Rect,
++    metrics: ScrollMetrics,
++    /// For each of the track's rows: nothing, a reply's mark (false) or a message's (true).
++    rows: Vec<Option<bool>>,
++}
++
++#[derive(Default)]
++pub(super) struct TurnMarksState {
++    /// The server the lists came from: another server's panes may use the same ids.
++    boot_id: String,
++    panes: HashMap<String, PaneTurnMarks>,
++    /// Set as a frame is composed, from `turn_marks_to_draw`.
++    pub(super) drawn: HashMap<String, DrawnMarks>,
++    /// Where the mouse was last seen.
++    hover: Option<(u16, u16)>,
++}
++
++/// The scroll offset that shows the row `row` one row below the top of the view, as the
++/// jump keys do.
++fn mark_offset(row: usize, metrics: ScrollMetrics) -> usize {
++    metrics
++        .max_offset_from_bottom
++        .saturating_sub(row.saturating_sub(1))
++}
++
++/// The scrollbar row of the mark for the scrollback row `row`.
++fn mark_track_row(row: usize, metrics: ScrollMetrics, track: Rect) -> Option<u16> {
++    let shown = ScrollMetrics {
++        offset_from_bottom: mark_offset(row, metrics),
++        ..metrics
++    };
++    crate::ui::scrollbar_thumb(shown, track).map(|thumb| thumb.top)
++}
++
++/// What to draw on each row of `track`.
++fn track_rows(marks: &[ListedMark], metrics: ScrollMetrics, track: Rect) -> Vec<Option<bool>> {
++    let mut rows = vec![None; usize::from(track.height)];
++    for mark in marks {
++        let Some(row) = mark_track_row(mark.row, metrics, track) else {
++            continue;
++        };
++        if let Some(drawn) = rows.get_mut(usize::from(row.saturating_sub(track.y))) {
++            *drawn = Some(*drawn == Some(true) || !mark.reply);
++        }
++    }
++    rows
++}
++
++impl ClientShellState {
++    /// Ask for the messages of each shown agent pane whose list is out of date, and
++    /// repaint when marks are no longer where they were drawn.
++    pub(crate) fn tick_turn_marks(&mut self, now: Instant, outcome: &mut ClientShellInput) {
++        let Some(snapshot) = self.snapshot.as_deref() else {
++            return;
++        };
++        if self.turn_marks.boot_id != snapshot.boot_id {
++            self.turn_marks.boot_id.clone_from(&snapshot.boot_id);
++            self.turn_marks.panes.clear();
++        }
++        self.turn_marks.panes.retain(|pane_id, _| {
++            snapshot
++                .agents
++                .iter()
++                .any(|agent| agent.pane_id == *pane_id)
++        });
++        outcome.repaint |= self.hits.panes.iter().any(|hit| {
++            let (Some(pane), Some(drawn), Some(track), Some(metrics)) = (
++                self.turn_marks.panes.get(&hit.pane_id),
++                self.turn_marks.drawn.get(&hit.pane_id),
++                hit.scrollbar_rect,
++                hit.scroll,
++            ) else {
++                return false;
++            };
++            metrics != drawn.metrics && track_rows(&pane.marks, metrics, track) != drawn.rows
++        });
++        // The marks are optional: no probing of servers that don't list the method, and
++        // no notices about them.
++        if !self.endpoint_is_online(&self.active_endpoint_id)
++            || !self
++                .endpoints
++                .iter()
++                .find(|endpoint| endpoint.endpoint_id == self.active_endpoint_id)
++                .and_then(|endpoint| endpoint.methods.as_ref())
++                .is_some_and(|methods| methods.iter().any(|method| method == "pane.mark.list"))
++        {
++            return;
++        }
++        let stale = self
++            .hits
++            .panes
++            .iter()
++            .filter(|hit| !hit.popup && hit.scrollbar_rect.is_some())
++            .filter_map(|hit| {
++                let agent = snapshot
++                    .agents
++                    .iter()
++                    .find(|agent| agent.pane_id == hit.pane_id)?;
++                let ask = TurnMarksAsk {
++                    state_change_seq: agent.state_change_seq,
++                    width: hit.inner_rect.width,
++                    extent: hit.scroll.map_or(0, |scroll| scroll.max_offset_from_bottom),
++                    at: now,
++                };
++                let stale = self.turn_marks.panes.get(&hit.pane_id).is_none_or(|pane| {
++                    let asked = pane.asked;
++                    (asked.state_change_seq, asked.width) != (ask.state_change_seq, ask.width)
++                            // A working agent's output only adds to what is listed once
++                            // its turn ends, which changes its state.
++                            || (agent.agent_status != AgentStatus::Working
++                                && asked.extent != ask.extent
++                                && now.saturating_duration_since(asked.at) >= RELIST_INTERVAL)
++                });
++                stale.then(|| (hit.pane_id.clone(), ask))
++            })
++            .filter(|(pane_id, _)| {
++                !self.pending_requests.values().any(|pending| {
++                    matches!(
++                        &pending.kind,
++                        PendingEndpointKind::PaneMarkList { pane_id: asked, .. } if asked == pane_id
++                    )
++                })
++            })
++            .collect::<Vec<_>>();
++        for (pane_id, asked) in stale {
++            self.push_endpoint_method_with_kind(
++                crate::api::schema::Method::PaneMarkList(crate::api::schema::PaneTarget {
++                    pane_id: pane_id.clone(),
++                }),
++                PendingEndpointKind::PaneMarkList { pane_id, asked },
++                outcome,
++            );
++        }
++    }
++
++    /// Keep what the server listed for a pane; a failed request lists nothing until the
++    /// pane is asked about again. Returns whether the marks changed.
++    pub(super) fn complete_turn_marks(
++        &mut self,
++        pane_id: String,
++        asked: TurnMarksAsk,
++        result: Result<crate::api::schema::ResponseResult, ClientShellEndpointError>,
++    ) -> bool {
++        let marks = match result {
++            Ok(crate::api::schema::ResponseResult::PaneMarkList { marks }) => marks
++                .into_iter()
++                .map(|mark| ListedMark {
++                    reply: mark.kind == PaneListedMarkKind::Reply,
++                    row: usize::try_from(mark.row).unwrap_or(usize::MAX),
++                    text: mark.text,
++                })
++                .collect(),
++            _ => Vec::new(),
++        };
++        let changed = self
++            .turn_marks
++            .panes
++            .get(&pane_id)
++            .map_or(!marks.is_empty(), |pane| pane.marks != marks);
++        self.turn_marks
++            .panes
++            .insert(pane_id, PaneTurnMarks { asked, marks });
++        changed
++    }
++
++    /// The pane's listed marks drawn on the screen row `row` of its scrollbar, oldest
++    /// first, each with its place in the list.
++    fn turn_marks_on_row<'a>(
++        &'a self,
++        hit: &PaneHit,
++        row: u16,
++    ) -> impl Iterator<Item = (usize, &'a ListedMark)> {
++        let marks = self.turn_marks.panes.get(&hit.pane_id);
++        let drawn = self.turn_marks.drawn.get(&hit.pane_id);
++        marks.zip(drawn).into_iter().flat_map(move |(pane, drawn)| {
++            pane.marks.iter().enumerate().filter(move |(_, mark)| {
++                mark_track_row(mark.row, drawn.metrics, drawn.track) == Some(row)
++            })
++        })
++    }
++
++    /// The scroll offset for a click on scrollbar row `row`, when a mark is drawn there:
++    /// the offset showing the oldest message or reply marked on that row.
++    pub(super) fn turn_mark_offset(&self, hit: &PaneHit, row: u16) -> Option<usize> {
++        let metrics = hit.scroll?;
++        self.turn_marks_on_row(hit, row)
++            .next()
++            .map(|(_, mark)| mark_offset(mark.row, metrics))
++    }
++
++    /// The mark under the mouse: its pane's place in the hit list and its scrollbar row.
++    /// None while something else owns the mouse or covers the panes.
++    fn hovered_turn_mark(&self) -> Option<(usize, u16)> {
++        let point = self.turn_marks.hover?;
++        if self.overlay.is_some()
++            || self.popup_terminal_id.is_some()
++            || self.chrome_drag.is_some()
++            || self.pane_mouse_gesture.is_some()
++        {
++            return None;
++        }
++        let (index, hit) = self.hits.panes.iter().enumerate().find(|(_, hit)| {
++            !hit.popup
++                && hit
++                    .scrollbar_rect
++                    .is_some_and(|track| super::contains(track, point))
++        })?;
++        self.turn_marks_on_row(hit, point.1).next()?;
++        Some((index, point.1))
++    }
++
++    pub(super) fn update_turn_mark_hover(
++        &mut self,
++        mouse: MouseEvent,
++        outcome: &mut ClientShellInput,
++    ) {
++        let before = self.hovered_turn_mark();
++        self.turn_marks.hover = Some((mouse.column, mouse.row));
++        outcome.repaint |= self.hovered_turn_mark() != before;
++    }
++
++    /// A pane surface patch can't be applied in place under a mark's card.
++    pub(super) fn turn_marks_block_patch(&self) -> bool {
++        self.hovered_turn_mark().is_some()
++    }
++
++    /// Put the marks back on the scrollbar cells a patch applied in place redraws.
++    pub(super) fn turn_marks_over_patch(
++        &self,
++        mut patch: ClientComposedSurfacePatch,
++    ) -> ClientComposedSurfacePatch {
++        if self.turn_marks.drawn.is_empty() {
++            return patch;
++        }
++        let palette = &self.config.palette;
++        for row in patch.rows.iter_mut().filter(|row| row.cells.len() == 1) {
++            let reply = self.turn_marks.drawn.values().find_map(|drawn| {
++                (row.x == drawn.track.x && row.y >= drawn.track.y)
++                    .then(|| drawn.rows.get(usize::from(row.y - drawn.track.y)))
++                    .flatten()
++                    .copied()
++                    .flatten()
++                    .map(|message| !message)
++            });
++            if let Some(reply) = reply {
++                mark_cell(&mut row.cells[0], reply, false, palette);
++            }
++        }
++        patch
++    }
++
++    /// Where each shown pane's marks go in a frame being composed.
++    pub(super) fn turn_marks_to_draw(&self, frame: &FrameData) -> HashMap<String, DrawnMarks> {
++        self.hits
++            .panes
++            .iter()
++            .filter_map(|hit| {
++                let (track, metrics) = (hit.scrollbar_rect?, hit.scroll?);
++                let pane = self.turn_marks.panes.get(&hit.pane_id)?;
++                (!hit.popup && track.x < frame.width && !pane.marks.is_empty()).then(|| {
++                    let rows = track_rows(&pane.marks, metrics, track);
++                    let drawn = DrawnMarks {
++                        track,
++                        metrics,
++                        rows,
++                    };
++                    (hit.pane_id.clone(), drawn)
++                })
++            })
++            .collect()
++    }
++
++    /// Draw each pane's marks over its scrollbar, and the card of the mark under the mouse.
++    pub(super) fn render_turn_marks(
++        &self,
++        frame: &mut FrameData,
++        occlusion: &mut crate::kitty_graphics::surface::Occlusion,
++    ) {
++        let hovered = self.hovered_turn_mark();
++        for (index, hit) in self.hits.panes.iter().enumerate() {
++            let Some(drawn) = self.turn_marks.drawn.get(&hit.pane_id) else {
++                continue;
++            };
++            for (row, message) in (drawn.track.y..).zip(&drawn.rows) {
++                let (Some(message), true) = (*message, row < frame.height) else {
++                    continue;
++                };
++                let cell = usize::from(row) * usize::from(frame.width) + usize::from(drawn.track.x);
++                if let Some(cell) = frame.cells.get_mut(cell) {
++                    let lit = hovered == Some((index, row));
++                    mark_cell(cell, !message, lit, &self.config.palette);
++                }
++            }
++        }
++        if let Some((index, row)) = hovered {
++            self.render_turn_mark_card(frame, index, row, occlusion);
++        }
++    }
++
++    /// A card left of the scrollbar listing what is marked on its row `row`: each message
++    /// with its number among the pane's messages, and each reply.
++    fn render_turn_mark_card(
++        &self,
++        frame: &mut FrameData,
++        index: usize,
++        row: u16,
++        occlusion: &mut crate::kitty_graphics::surface::Occlusion,
++    ) {
++        let Some(hit) = self.hits.panes.get(index) else {
++            return;
++        };
++        let Some(pane) = self.turn_marks.panes.get(&hit.pane_id) else {
++            return;
++        };
++        let messages = pane.marks.iter().filter(|mark| !mark.reply).count();
++        let marked = self.turn_marks_on_row(hit, row).collect::<Vec<_>>();
++        let mut lines = marked
++            .iter()
++            .take(CARD_ROWS)
++            .map(|(place, mark)| {
++                let label = if mark.reply {
++                    REPLY_LABEL.to_owned()
++                } else {
++                    let number = pane.marks[..=*place]
++                        .iter()
++                        .filter(|mark| !mark.reply)
++                        .count();
++                    format!("#{number}/{messages}")
++                };
++                (label, mark.text.as_str())
++            })
++            .collect::<Vec<_>>();
++        let more = marked.len().saturating_sub(CARD_ROWS);
++        let more = (more > 0).then(|| format!("+{more} more"));
++        if let Some(more) = more.as_deref() {
++            lines.push((String::new(), more));
++        }
++        let label_width = lines
++            .iter()
++            .map(|(label, _)| UnicodeWidthStr::width(label.as_str()))
++            .max()
++            .unwrap_or(0);
++        let text_width = lines
++            .iter()
++            .map(|(_, text)| UnicodeWidthStr::width(*text))
++            .max()
++            .unwrap_or(0)
++            .min(CARD_TEXT_WIDTH);
++        // Borders, a space either side, and the gap after the numbers.
++        let chrome = 2 + 2 + label_width + 2;
++        let area = hit.inner_rect;
++        let width = u16::try_from(chrome + text_width)
++            .unwrap_or(u16::MAX)
++            .min(area.width);
++        let height = lines.len() as u16 + 2;
++        if usize::from(width) < chrome + 6 || height > area.height {
++            return;
++        }
++        let y = row
++            .saturating_sub(height / 2)
++            .clamp(area.y, area.bottom() - height);
++        let rect = Rect::new(area.right() - width, y, width, height);
++        let Some(mut buffer) = frame.to_ratatui_buffer() else {
++            return;
++        };
++        let palette = &self.config.palette;
++        let block = Block::bordered()
++            .border_type(BorderType::Rounded)
++            .border_style(Style::default().fg(palette.surface1))
++            .style(Style::default().bg(palette.panel_bg));
++        let inner = block.inner(rect);
++        Clear.render(rect, &mut buffer);
++        block.render(rect, &mut buffer);
++        let text_width = usize::from(width) - chrome;
++        for (line, (label, text)) in lines.iter().enumerate() {
++            let gap = label_width - UnicodeWidthStr::width(label.as_str()) + 2;
++            Paragraph::new(Line::from(vec![
++                Span::raw(" "),
++                Span::styled(
++                    format!("{label}{:gap$}", ""),
++                    Style::default().fg(palette.overlay0),
++                ),
++                Span::styled(
++                    crate::ui::truncate_end(text, text_width),
++                    Style::default().fg(palette.text),
++                ),
++            ]))
++            .render(
++                Rect::new(inner.x, inner.y + line as u16, inner.width, 1),
++                &mut buffer,
++            );
++        }
++        occlusion.cover(rect);
++        let cursor = frame.cursor.clone();
++        frame.replace_from_ratatui_buffer_preserving_effects(&buffer, cursor);
++    }
++}
++
++/// Turn a scrollbar cell into a mark: a message's or a reply's, lit under the mouse.
++fn mark_cell(cell: &mut crate::protocol::CellData, reply: bool, lit: bool, palette: &Palette) {
++    let color = match (lit, reply) {
++        (true, _) => palette.text,
++        (false, false) => palette.accent,
++        (false, true) => palette.overlay1,
++    };
++    cell.symbol = if reply { REPLY_GLYPH } else { MESSAGE_GLYPH }.into();
++    cell.fg = crate::protocol::color_to_u32(color);
++}
+diff --git a/src/client/shell/worktrees.rs b/src/client/shell/worktrees.rs
+index 56c554c8..2a1b7ab2 100644
+--- a/src/client/shell/worktrees.rs
++++ b/src/client/shell/worktrees.rs
+@@ -538,6 +538,7 @@ impl ClientShellState {
+                 | PendingEndpointKind::WordSelection { .. }
+                 | PendingEndpointKind::PaneLinkActivate { .. }
+                 | PendingEndpointKind::PaneLinkResolve { .. }
++                | PendingEndpointKind::PaneMarkList { .. }
+                 | PendingEndpointKind::CopyMotion { .. }
+                 | PendingEndpointKind::CopySearch { .. },
+                 Err(_),
+diff --git a/src/pane.rs b/src/pane.rs
+index 2b224c1b..092964cf 100644
+--- a/src/pane.rs
++++ b/src/pane.rs
+@@ -3436,18 +3436,25 @@ impl PaneRuntime {
+     }
+ 
+     /// Fork: scroll to the previous or next turn end or message; false when none.
++    /// `claude`: the pane's agent is Claude Code.
+     pub(crate) fn fork_scroll_to_mark(
+         &self,
+         kind: turn_marks::MarkKind,
+         direction: turn_marks::MarkDirection,
++        claude: bool,
+     ) -> bool {
+-        let moved = self.terminal.fork_scroll_to_mark(kind, direction);
++        let moved = self.terminal.fork_scroll_to_mark(kind, direction, claude);
+         if moved {
+             self.compression.wake();
+         }
+         moved
+     }
+ 
++    /// Fork: the messages in the scrollback, oldest first.
++    pub(crate) fn fork_listed_marks(&self, claude: bool) -> Vec<turn_marks::ListedMark> {
++        self.terminal.fork_listed_marks(claude)
++    }
++
+     pub(crate) fn search_text_window(
+         &self,
+         query: &str,
+diff --git a/src/pane/terminal.rs b/src/pane/terminal.rs
+index d611a153..a344ba9a 100644
+--- a/src/pane/terminal.rs
++++ b/src/pane/terminal.rs
+@@ -293,12 +293,19 @@ impl PaneTerminal {
+     }
+ 
+     /// Fork: scroll to the previous or next turn end or message; false when none.
++    /// `claude`: the pane's agent is Claude Code.
+     pub(crate) fn fork_scroll_to_mark(
+         &self,
+         kind: super::turn_marks::MarkKind,
+         direction: super::turn_marks::MarkDirection,
++        claude: bool,
+     ) -> bool {
+-        self.ghostty.fork_scroll_to_mark(kind, direction)
++        self.ghostty.fork_scroll_to_mark(kind, direction, claude)
++    }
++
++    /// Fork: the messages in the scrollback, oldest first.
++    pub(crate) fn fork_listed_marks(&self, claude: bool) -> Vec<super::turn_marks::ListedMark> {
++        self.ghostty.fork_listed_marks(claude)
+     }
+ 
+     pub(crate) fn search_text_window(
+@@ -1872,7 +1879,8 @@ impl GhosttyPaneTerminal {
+ 
+     pub(crate) fn fork_mark_working(&self) {
+         if let Ok(mut core) = self.core.lock() {
+-            core.fork_turn_marks.mark_working();
++            let core = &mut *core;
++            core.fork_turn_marks.mark_working(&core.terminal);
+         }
+     }
+ 
+@@ -1880,6 +1888,7 @@ impl GhosttyPaneTerminal {
+         &self,
+         kind: super::turn_marks::MarkKind,
+         direction: super::turn_marks::MarkDirection,
++        claude: bool,
+     ) -> bool {
+         let Ok(mut core) = self.core.lock() else {
+             return false;
+@@ -1887,7 +1896,7 @@ impl GhosttyPaneTerminal {
+         let core = &mut *core;
+         let Some(offset) = core
+             .fork_turn_marks
+-            .offset_for(&core.terminal, kind, direction)
++            .offset_for(&core.terminal, kind, direction, claude)
+         else {
+             return false;
+         };
+@@ -1895,6 +1904,14 @@ impl GhosttyPaneTerminal {
+         true
+     }
+ 
++    pub(crate) fn fork_listed_marks(&self, claude: bool) -> Vec<super::turn_marks::ListedMark> {
++        let Ok(mut core) = self.core.lock() else {
++            return Vec::new();
++        };
++        let core = &mut *core;
++        core.fork_turn_marks.listed(&core.terminal, claude)
++    }
++
+     pub fn keyboard_protocol(&self) -> Option<crate::input::KeyboardProtocol> {
+         let Ok(core) = self.core.lock() else {
+             return None;
+diff --git a/src/pane/turn_marks.rs b/src/pane/turn_marks.rs
+index 5d256865..820bef5e 100644
+--- a/src/pane/turn_marks.rs
++++ b/src/pane/turn_marks.rs
+@@ -1,11 +1,27 @@
+ //! Fork: marks in a pane's scrollback where an agent finished a turn and where the
+ //! user's next message began, so the view can jump between them.
++//!
++//! The marks are made as the agent goes idle and starts working, so they only cover
++//! turns the server watched. Claude Code prints the user's messages and its replies in
++//! a shape that can be found in the scrollback itself, so for it those are read from
++//! there instead: that also covers a resumed session's history and anything it reprints.
+ 
+-use crate::ghostty::{ActiveScreen, CellWide, ScreenTextRow, Terminal, TrackedRow};
++use crate::ghostty::{ActiveScreen, CellColor, CellWide, ScreenTextRow, Terminal, TrackedRow};
+ 
+ /// Marks kept per pane; the oldest go first.
+ const MAX_MARKS: usize = 2000;
+ 
++/// Rows read for the text of a listed message and of a listed reply, and the most
++/// characters kept of either.
++const MESSAGE_ROWS: usize = 3;
++const REPLY_ROWS: usize = 1;
++const MESSAGE_CHARS: usize = 200;
++
++/// Claude Code starts each of the user's messages and each thing it does or says with
++/// these, in the first column.
++const CLAUDE_USER_SIGN: char = '❯';
++const CLAUDE_AGENT_SIGN: char = '●';
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub(crate) enum MarkKind {
+     /// Where the agent's answer ended.
+@@ -20,6 +36,24 @@ pub(crate) enum MarkDirection {
+     Next,
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum ListedKind {
++    /// One of the user's messages.
++    Input,
++    /// Something the agent said to the user.
++    Reply,
++}
++
++/// A message in the scrollback, for listing.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(crate) struct ListedMark {
++    pub(crate) kind: ListedKind,
++    /// Its first row, counted from the top of the scrollback.
++    pub(crate) row: usize,
++    /// Its first lines as printed, without the agent's sign.
++    pub(crate) text: String,
++}
++
+ struct TurnMark {
+     row: TrackedRow,
+     /// The agent went idle here after working or waiting (not on first detection).
+@@ -70,23 +104,34 @@ impl TurnMarks {
+     }
+ 
+     /// The agent started working after being idle. If the user typed in between,
+-    /// their message begins at the last mark.
+-    pub(crate) fn mark_working(&mut self) {
+-        if std::mem::take(&mut self.typed) {
+-            if let Some(last) = self.marks.last_mut() {
+-                last.input = true;
+-            }
++    /// their message begins at the last mark, as long as that mark is still on the
++    /// screen: a message is printed where the prompt was. A mark the agent has since
++    /// printed a screenful past (a resumed session's history, say) is not where it went.
++    pub(crate) fn mark_working(&mut self, terminal: &Terminal) {
++        if !std::mem::take(&mut self.typed) {
++            return;
++        }
++        let Some(last) = self.marks.last_mut() else {
++            return;
++        };
++        let on_screen = screen_top(terminal)
++            .zip(terminal.tracked_screen_row(&last.row))
++            .is_some_and(|(top, row)| row >= top);
++        if on_screen {
++            last.input = true;
+         }
+     }
+ 
+     /// The scroll offset (rows from the bottom) showing the previous or next mark of
+     /// `kind`: a turn's end at the bottom of the view, a message's start at the top.
+     /// Next after the last mark is the live bottom; previous before the first is None.
++    /// With `claude`, the messages are the ones Claude Code printed.
+     pub(crate) fn offset_for(
+         &mut self,
+         terminal: &Terminal,
+         kind: MarkKind,
+         direction: MarkDirection,
++        claude: bool,
+     ) -> Option<usize> {
+         self.marks
+             .retain(|mark| terminal.tracked_screen_row(&mark.row).is_some());
+@@ -94,23 +139,32 @@ impl TurnMarks {
+         let max = scrollbar.total.saturating_sub(scrollbar.len);
+         let current = max.saturating_sub(scrollbar.offset);
+         let newest = self.marks.len().saturating_sub(1);
+-        let offsets = self
+-            .marks
+-            .iter()
+-            .enumerate()
+-            .filter(|(index, mark)| match kind {
+-                // The newest turn's end sits right above the prompt until it's answered.
+-                MarkKind::TurnEnd => mark.turn_end && (mark.input || *index != newest),
+-                MarkKind::Input => mark.input,
+-            })
+-            .filter_map(|(_, mark)| terminal.tracked_screen_row(&mark.row))
+-            .map(|row| {
+-                let top = match kind {
+-                    MarkKind::TurnEnd => (row + 1).saturating_sub(scrollbar.len),
+-                    MarkKind::Input => row.saturating_sub(1),
+-                };
+-                max.saturating_sub(top)
+-            });
++        let offsets = if claude && kind == MarkKind::Input {
++            claude_rows(terminal)
++                .into_iter()
++                .filter(|(kind, _)| *kind == ListedKind::Input)
++                .map(|(_, row)| max.saturating_sub(row.saturating_sub(1)))
++                .collect::<Vec<_>>()
++        } else {
++            self.marks
++                .iter()
++                .enumerate()
++                .filter(|(index, mark)| match kind {
++                    // The newest turn's end sits right above the prompt until it's answered.
++                    MarkKind::TurnEnd => mark.turn_end && (mark.input || *index != newest),
++                    MarkKind::Input => mark.input,
++                })
++                .filter_map(|(_, mark)| terminal.tracked_screen_row(&mark.row))
++                .map(|row| {
++                    let top = match kind {
++                        MarkKind::TurnEnd => (row + 1).saturating_sub(scrollbar.len),
++                        MarkKind::Input => row.saturating_sub(1),
++                    };
++                    max.saturating_sub(top)
++                })
++                .collect()
++        };
++        let offsets = offsets.into_iter();
+         match direction {
+             MarkDirection::Previous => offsets.filter(|&offset| offset > current).min(),
+             MarkDirection::Next => Some(
+@@ -121,6 +175,150 @@ impl TurnMarks {
+             ),
+         }
+     }
++
++    /// The messages in the scrollback, oldest first: the user's, and with `claude` the
++    /// ones Claude Code printed, its replies among them.
++    pub(crate) fn listed(&mut self, terminal: &Terminal, claude: bool) -> Vec<ListedMark> {
++        let total = terminal.total_rows().unwrap_or(0);
++        if claude {
++            return claude_rows(terminal)
++                .into_iter()
++                .map(|(kind, row)| {
++                    let rows = match kind {
++                        ListedKind::Input => MESSAGE_ROWS,
++                        ListedKind::Reply => REPLY_ROWS,
++                    };
++                    ListedMark {
++                        kind,
++                        row,
++                        text: message_text(terminal, row, (row + rows).min(total)),
++                    }
++                })
++                .collect();
++        }
++        self.marks
++            .retain(|mark| terminal.tracked_screen_row(&mark.row).is_some());
++        self.marks
++            .iter()
++            .filter(|mark| mark.input)
++            .filter_map(|mark| terminal.tracked_screen_row(&mark.row))
++            .map(|row| ListedMark {
++                kind: ListedKind::Input,
++                row,
++                text: message_text(terminal, row, (row + MESSAGE_ROWS).min(total)),
++            })
++            .collect()
++    }
++}
++
++/// What Claude Code printed in the scrollback, oldest first, each with its first row
++/// (counted from the top of the scrollback): the user's messages and its replies.
++///
++/// A message is a row that starts with `❯` and some text after a blank row; the prompt
++/// being typed into follows a rule instead. A reply is a row that starts with a `●` in
++/// the colour of the messages' text: a tool call's is coloured by how the call went. So
++/// replies are only told apart once the scrollback holds a message.
++fn claude_rows(terminal: &Terminal) -> Vec<(ListedKind, usize)> {
++    let total = terminal.total_rows().unwrap_or(0);
++    let starts_text = |row: usize| {
++        cell_char(terminal, 1, row).is_none_or(char::is_whitespace)
++            && cell_char(terminal, 2, row).is_some_and(|text| !text.is_whitespace())
++    };
++    let mut inputs = Vec::new();
++    let mut bullets = Vec::new();
++    for row in 0..total {
++        match cell_char(terminal, 0, row) {
++            Some(CLAUDE_USER_SIGN)
++                if starts_text(row) && (row == 0 || row_is_blank(terminal, row - 1)) =>
++            {
++                inputs.push(row);
++            }
++            Some(CLAUDE_AGENT_SIGN) if starts_text(row) => bullets.push(row),
++            _ => {}
++        }
++    }
++    let mut text_colors: Vec<(Option<CellColor>, usize)> = Vec::new();
++    for color in inputs
++        .iter()
++        .filter_map(|&row| cell_color(terminal, 2, row))
++    {
++        match text_colors.iter_mut().find(|(seen, _)| *seen == color) {
++            Some((_, count)) => *count += 1,
++            None => text_colors.push((color, 1)),
++        }
++    }
++    let text_color = text_colors
++        .into_iter()
++        .max_by_key(|(_, count)| *count)
++        .map(|(color, _)| color);
++    let mut rows = inputs
++        .into_iter()
++        .map(|row| (ListedKind::Input, row))
++        .chain(
++            bullets
++                .into_iter()
++                .filter(|&row| text_color.is_some() && cell_color(terminal, 0, row) == text_color)
++                .map(|row| (ListedKind::Reply, row)),
++        )
++        .collect::<Vec<_>>();
++    rows.sort_by_key(|(_, row)| *row);
++    rows
++}
++
++/// The first character of the cell in column `x` of `row` (counted from the top of the
++/// scrollback); None for an empty cell.
++fn cell_char(terminal: &Terminal, x: u16, row: usize) -> Option<char> {
++    let (_, graphemes) = terminal.screen_cell(x, u32::try_from(row).ok()?).ok()?;
++    char::from_u32(*graphemes.first()?)
++}
++
++/// The text colour of a cell; the inner None is the terminal's own text colour.
++fn cell_color(terminal: &Terminal, x: u16, row: usize) -> Option<Option<CellColor>> {
++    let style = terminal
++        .screen_cell_style(x, u32::try_from(row).ok()?)
++        .ok()?;
++    Some(style.fg_color)
++}
++
++fn row_is_blank(terminal: &Terminal, row: usize) -> bool {
++    let Ok(row) = u32::try_from(row) else {
++        return false;
++    };
++    let mut blank = true;
++    let visited = terminal.for_each_screen_row_cell(row, |_, graphemes| {
++        blank &= graphemes
++            .iter()
++            .all(|&code| char::from_u32(code).is_none_or(char::is_whitespace));
++    });
++    visited.is_ok() && blank
++}
++
++/// The message printed from `row` up to row `end` (both counted from the top of the
++/// scrollback): its lines up to a blank one or Claude Code's output sign, joined with
++/// spaces, without the agent's sign.
++fn message_text(terminal: &Terminal, row: usize, end: usize) -> String {
++    let Ok(rows) = terminal.screen_text_rows_range(row, end) else {
++        return String::new();
++    };
++    let text = rows
++        .iter()
++        .map(|row| row_text(row).trim().to_owned())
++        .skip_while(String::is_empty)
++        .take_while(|line| !line.is_empty() && !line.starts_with('⎿'))
++        .collect::<Vec<_>>()
++        .join(" ");
++    text.strip_prefix([CLAUDE_USER_SIGN, '>', CLAUDE_AGENT_SIGN])
++        .unwrap_or(&text)
++        .trim_start()
++        .chars()
++        .take(MESSAGE_CHARS)
++        .collect()
++}
++
++/// The screen's first row, counted from the top of the scrollback.
++fn screen_top(terminal: &Terminal) -> Option<usize> {
++    let total = terminal.total_rows().ok()?;
++    Some(total.saturating_sub(usize::from(terminal.rows().ok()?)))
+ }
+ 
+ /// The first row of the agent's prompt area, counted from the top of the scrollback:
+@@ -197,7 +395,7 @@ mod tests {
+         // Back to the rule's row: cursor is on the status line, three rows below it.
+         terminal.write(b"\r\x1b[3A\x1b[J");
+         terminal.write(format!("> {message}\r\n").as_bytes());
+-        marks.mark_working();
++        marks.mark_working(terminal);
+     }
+ 
+     fn view_top(terminal: &Terminal) -> usize {
+@@ -221,7 +419,7 @@ mod tests {
+         kind: MarkKind,
+         direction: MarkDirection,
+     ) {
+-        if let Some(offset) = marks.offset_for(terminal, kind, direction) {
++        if let Some(offset) = marks.offset_for(terminal, kind, direction, false) {
+             let max = {
+                 let scrollbar = terminal.scrollbar().expect("scrollbar");
+                 scrollbar.total - scrollbar.len
+@@ -358,10 +556,10 @@ mod tests {
+         let (mut terminal, mut marks) = (terminal(), TurnMarks::default());
+         answer(&mut terminal, "one", 20);
+         marks.mark_idle(&mut terminal, true);
+-        marks.mark_working();
++        marks.mark_working(&terminal);
+         answer(&mut terminal, "two", 20);
+         assert_eq!(
+-            marks.offset_for(&terminal, MarkKind::Input, MarkDirection::Previous),
++            marks.offset_for(&terminal, MarkKind::Input, MarkDirection::Previous, false),
+             None
+         );
+     }
+@@ -376,19 +574,236 @@ mod tests {
+         send(&mut terminal, &mut marks, "question");
+         answer(&mut terminal, "two", 20);
+         assert!(marks
+-            .offset_for(&terminal, MarkKind::Input, MarkDirection::Previous)
++            .offset_for(&terminal, MarkKind::Input, MarkDirection::Previous, false)
+             .is_some());
+         // Far more output than the scrollback keeps.
+         for line in 0..50_000 {
+             terminal.write(format!("flood {line}\r\n").as_bytes());
+         }
+         assert_eq!(
+-            marks.offset_for(&terminal, MarkKind::Input, MarkDirection::Previous),
++            marks.offset_for(&terminal, MarkKind::Input, MarkDirection::Previous, false),
+             None
+         );
+         assert!(marks.marks.is_empty());
+     }
+ 
++    #[test]
++    fn inputs_list_each_message_with_its_row_and_text() {
++        let (mut terminal, mut marks) = (terminal(), TurnMarks::default());
++        session(&mut terminal, &mut marks);
++
++        let inputs = marks.listed(&terminal, false);
++        assert_eq!(inputs.len(), 3);
++        for (input, message) in inputs.iter().zip(["first", "second", "third"]) {
++            assert_eq!(row(&terminal, input.row), format!("> {message} question"));
++        }
++        // The same rows the jump keys show one below the top of the view.
++        jump(
++            &mut terminal,
++            &mut marks,
++            MarkKind::Input,
++            MarkDirection::Previous,
++        );
++        assert_eq!(view_top(&terminal) + 1, inputs[2].row);
++    }
++
++    #[test]
++    fn inputs_leave_out_marks_that_are_not_messages() {
++        let (mut terminal, mut marks) = (terminal(), TurnMarks::default());
++        answer(&mut terminal, "one", 20);
++        marks.mark_idle(&mut terminal, true);
++        marks.mark_working(&terminal);
++        answer(&mut terminal, "two", 20);
++        marks.mark_idle(&mut terminal, true);
++
++        assert_eq!(marks.listed(&terminal, false), Vec::new());
++    }
++
++    #[test]
++    fn a_mark_the_agent_printed_a_screenful_past_is_not_the_message() {
++        let (mut terminal, mut marks) = (terminal(), TurnMarks::default());
++        // Like resuming a session: idle at startup, keys, then the history is printed.
++        prompt(&mut terminal);
++        marks.mark_idle(&mut terminal, false);
++        marks.note_typed();
++        answer(&mut terminal, "history", 30);
++        marks.mark_working(&terminal);
++
++        assert_eq!(marks.listed(&terminal, false), Vec::new());
++        assert_eq!(
++            marks.offset_for(&terminal, MarkKind::Input, MarkDirection::Previous, false),
++            None
++        );
++    }
++
++    /// Like Claude Code: the message replaces the prompt area, then a blank line, then
++    /// the answer.
++    fn send_lines(terminal: &mut Terminal, marks: &mut TurnMarks, printed: &str) {
++        terminal.write(b"welcome\r\n");
++        prompt(terminal);
++        marks.mark_idle(terminal, false);
++        marks.note_typed();
++        terminal.write(b"\r\x1b[3A\x1b[J");
++        terminal.write(format!("{printed}\r\n\r\nthe answer\r\n").as_bytes());
++        marks.mark_working(terminal);
++    }
++
++    #[test]
++    fn a_listed_message_is_its_lines_up_to_a_blank_one_without_the_prompt_sign() {
++        let (mut terminal, mut marks) = (terminal(), TurnMarks::default());
++        send_lines(
++            &mut terminal,
++            &mut marks,
++            "❯ a question that goes on\r\n  over two lines",
++        );
++
++        let inputs = marks.listed(&terminal, false);
++        assert_eq!(inputs.len(), 1);
++        assert_eq!(inputs[0].text, "a question that goes on over two lines");
++    }
++
++    #[test]
++    fn a_listed_command_stops_at_its_output() {
++        let (mut terminal, mut marks) = (terminal(), TurnMarks::default());
++        send_lines(&mut terminal, &mut marks, "❯ /compact\r\n  ⎿  Compacted");
++
++        assert_eq!(marks.listed(&terminal, false).remove(0).text, "/compact");
++    }
++
++    #[test]
++    fn a_listed_message_is_cut_to_its_first_rows_and_characters() {
++        let (mut terminal, mut marks) = (terminal(), TurnMarks::default());
++        let line = "x".repeat(usize::from(COLS) - 2);
++        send_lines(
++            &mut terminal,
++            &mut marks,
++            &format!("> {line}\r\n  {line}\r\n  {line}\r\n  {line}"),
++        );
++
++        let text = marks.listed(&terminal, false).remove(0).text;
++        assert_eq!(text, [line.as_str(); MESSAGE_ROWS].join(" "));
++
++        let (mut terminal, mut marks) = (
++            Terminal::new(400, ROWS, 10_000_000).expect("terminal"),
++            TurnMarks::default(),
++        );
++        send_lines(&mut terminal, &mut marks, &format!("> {}", "y".repeat(300)));
++        assert_eq!(
++            marks.listed(&terminal, false).remove(0).text,
++            "y".repeat(MESSAGE_CHARS)
++        );
++    }
++
++    /// A message, a reply and a tool call as Claude Code prints them (its dark theme),
++    /// each after a blank row.
++    fn claude_message(text: &str) -> String {
++        format!(
++            "\r\n\x1b[38;2;153;153;153m\x1b[48;2;55;55;55m❯ \x1b[0m\x1b[38;2;255;255;255m\x1b[48;2;55;55;55m{text}\x1b[0m\r\n"
++        )
++    }
++
++    fn claude_reply(text: &str) -> String {
++        format!("\r\n\x1b[38;2;255;255;255m● \x1b[0m{text}\r\n")
++    }
++
++    fn claude_tool(call: &str, output: &str) -> String {
++        format!("\r\n\x1b[38;2;78;186;101m● \x1b[0m\x1b[1m{call}\x1b[0m\r\n  ⎿  {output}\r\n")
++    }
++
++    /// Two messages with replies and tool calls between them, then the prompt: more than
++    /// a screenful, none of it watched by a `TurnMarks`.
++    fn claude_history(terminal: &mut Terminal) {
++        for printed in [
++            claude_message("how does it work?"),
++            claude_tool("Read(src/lib.rs)", "Read 20 lines"),
++            claude_reply("It reads the rows."),
++            claude_tool("Bash(ls)", "3 files"),
++            claude_reply("And then it lists them."),
++            claude_message("thanks"),
++        ] {
++            terminal.write(printed.as_bytes());
++        }
++        terminal.write(b"\r\n");
++        prompt(terminal);
++    }
++
++    #[test]
++    fn claude_code_scrollback_lists_its_messages_and_replies_without_marks() {
++        let mut terminal = terminal();
++        claude_history(&mut terminal);
++
++        let listed = TurnMarks::default().listed(&terminal, true);
++        assert_eq!(
++            listed
++                .iter()
++                .map(|mark| (mark.kind, mark.text.as_str()))
++                .collect::<Vec<_>>(),
++            [
++                (ListedKind::Input, "how does it work?"),
++                (ListedKind::Reply, "It reads the rows."),
++                (ListedKind::Reply, "And then it lists them."),
++                (ListedKind::Input, "thanks"),
++            ]
++        );
++        assert_eq!(row(&terminal, listed[0].row), "❯ how does it work?");
++        assert_eq!(row(&terminal, listed[2].row), "● And then it lists them.");
++        // Another agent's pane only lists what the server marked.
++        assert_eq!(TurnMarks::default().listed(&terminal, false), Vec::new());
++    }
++
++    #[test]
++    fn the_prompt_being_typed_into_is_not_a_claude_code_message() {
++        let mut terminal = terminal();
++        terminal.write(claude_message("a question").as_bytes());
++        terminal.write("\r\n──────────\r\n❯ a draft\r\n──────────\r\n  status".as_bytes());
++
++        let listed = TurnMarks::default().listed(&terminal, true);
++        assert_eq!(listed.len(), 1);
++        assert_eq!(listed[0].text, "a question");
++    }
++
++    #[test]
++    fn claude_code_replies_are_only_told_from_tool_calls_once_a_message_shows_the_text_colour() {
++        let mut terminal = terminal();
++        terminal.write(claude_tool("Bash(ls)", "3 files").as_bytes());
++        terminal.write(claude_reply("Three files.").as_bytes());
++        assert_eq!(TurnMarks::default().listed(&terminal, true), Vec::new());
++
++        terminal.write(claude_message("and now?").as_bytes());
++        let listed = TurnMarks::default().listed(&terminal, true);
++        assert_eq!(
++            listed.iter().map(|mark| mark.kind).collect::<Vec<_>>(),
++            [ListedKind::Reply, ListedKind::Input]
++        );
++    }
++
++    #[test]
++    fn the_message_keys_jump_between_the_messages_claude_code_printed() {
++        let mut terminal = terminal();
++        claude_history(&mut terminal);
++        // Scroll the newest message off the screen too, or it is already in view.
++        answer(&mut terminal, "more", 12);
++        let mut marks = TurnMarks::default();
++        let max = {
++            let scrollbar = terminal.scrollbar().expect("scrollbar");
++            scrollbar.total - scrollbar.len
++        };
++
++        let offset = marks
++            .offset_for(&terminal, MarkKind::Input, MarkDirection::Previous, true)
++            .expect("the newest message");
++        terminal.scroll_viewport_row(max - offset);
++        assert_eq!(row(&terminal, view_top(&terminal) + 1), "❯ thanks");
++        let offset = marks
++            .offset_for(&terminal, MarkKind::Input, MarkDirection::Previous, true)
++            .expect("the first message");
++        terminal.scroll_viewport_row(max - offset);
++        assert_eq!(
++            row(&terminal, view_top(&terminal) + 1),
++            "❯ how does it work?"
++        );
++    }
++
+     #[test]
+     fn the_prompt_area_starts_at_the_rule_above_the_prompt() {
+         let mut terminal = terminal();
+diff --git a/src/server/client_commands.rs b/src/server/client_commands.rs
+index ecdc99d2..828778bb 100644
+--- a/src/server/client_commands.rs
++++ b/src/server/client_commands.rs
+@@ -28,6 +28,8 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
+     "pane.input.set",
+     "pane.link.activate",
+     "pane.link.resolve",
++    // Fork: the client marks the user's messages on the pane scrollbar.
++    "pane.mark.list",
+     // Fork: the sidebar's space tree moves agents between spaces.
+     "pane.move",
+     "pane.rename",
+@@ -302,6 +304,10 @@ mod tests {
+             Some("f5e4a3e01453ae7b188f127ce951c12c20e0bebcc17cc364eeb6d1a01fd5bf81")
+         );
+         // Fork: additive, so it is frozen here rather than in the published fixture.
++        assert_eq!(
++            actual.remove("pane.mark.list").as_deref(),
++            Some("5ba2fbe60db2b25f9935e154dc3a6b6b3b757aee29c6e60c73fa5607374ca87d")
++        );
+         assert_eq!(
+             actual.remove("pane.move").as_deref(),
+             Some("eaed63cf205db2dc043ecce9e1a79cdca7f6e2521b364226bbf3121affadce7c")
+diff --git a/src/terminal/runtime.rs b/src/terminal/runtime.rs
+index dac05cd5..e4953c39 100644
+--- a/src/terminal/runtime.rs
++++ b/src/terminal/runtime.rs
+@@ -302,12 +302,22 @@ impl TerminalRuntime {
+     }
+ 
+     /// Fork: scroll to the previous or next turn end or message; false when none.
++    /// `claude`: the pane's agent is Claude Code.
+     pub(crate) fn fork_scroll_to_mark(
+         &self,
+         kind: crate::pane::turn_marks::MarkKind,
+         direction: crate::pane::turn_marks::MarkDirection,
++        claude: bool,
+     ) -> bool {
+-        self.0.fork_scroll_to_mark(kind, direction)
++        self.0.fork_scroll_to_mark(kind, direction, claude)
++    }
++
++    /// Fork: the messages in the scrollback, oldest first.
++    pub(crate) fn fork_listed_marks(
++        &self,
++        claude: bool,
++    ) -> Vec<crate::pane::turn_marks::ListedMark> {
++        self.0.fork_listed_marks(claude)
+     }
+ 
+     pub(crate) fn search_text_window(
