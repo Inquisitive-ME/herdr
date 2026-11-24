@@ -97,6 +97,9 @@ The patches in `patches/`:
    - `pane.mark.list` lists a pane's messages and replies with the row each starts on.
    - This changes the server: a running server needs the live handoff (below). With an
      older server there are just no marks.
+8. **`herdr machine enable` / `disable` take a label**, like `status` and `reconnect`:
+   `herdr machine disable mac`. The profile ID still works. CLI only, so no server
+   restart is needed.
 
 Builds: Linux x86_64, Linux ARM (aarch64) and Apple Silicon macOS. There are no
 Windows or Intel Mac builds; use upstream herdr there.

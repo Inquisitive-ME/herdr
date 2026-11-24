@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Richard Swanson <rswanson05@gmail.com>
+Date: Tue, 24 Nov 2026 07:15:27 -0600
+Subject: [PATCH] feat: let machine enable and disable take a label
+
+enable and disable only accepted a profile ID, while status and
+reconnect also accept the machine's label. find_machine now finds a
+machine by ID or label without checking whether it is enabled, and
+resolve_machine adds that check on top, so enable can find a disabled
+machine by its label.
+
+diff --git a/src/cli/machine.rs b/src/cli/machine.rs
+index 2459805a..30610747 100644
+--- a/src/cli/machine.rs
++++ b/src/cli/machine.rs
+@@ -14,8 +14,8 @@ const HELP: &str = "Usage:
+   herdr machine add <ssh-target> [--label <label>] [--remote-session <name>]
+   herdr machine rename <profile-id> --label <label>
+   herdr machine remove <profile-id>
+-  herdr machine enable <profile-id>
+-  herdr machine disable <profile-id>
++  herdr machine enable <label-or-id>
++  herdr machine disable <label-or-id>
+ 
+ Add prepares the remote Herdr installation and starts its server before saving.
+ Missing or incompatible installations require approval in an interactive terminal.
+@@ -536,11 +536,18 @@ fn remove(args: &[String]) -> std::io::Result<i32> {
+ 
+ fn set_enabled(args: &[String], enabled: bool) -> std::io::Result<i32> {
+     let action = if enabled { "enable" } else { "disable" };
+-    let usage = format!("usage: herdr machine {action} <profile-id>");
+-    let Some(id) = one_profile_id(args, &usage)? else {
++    let [selector] = args else {
++        eprintln!("usage: herdr machine {action} <label-or-id>");
+         return Ok(2);
+     };
+     let mut catalog = load_catalog()?;
++    let id = match super::target::find_machine(&catalog.ssh, selector) {
++        Ok(profile) => profile.id.clone(),
++        Err(error) => {
++            eprintln!("{error}");
++            return Ok(2);
++        }
++    };
+     let previous_selection = catalog.selected_profile.clone();
+     if !catalog.set_enabled(&id, enabled) {
+         eprintln!("machine profile {id} was not found");
+diff --git a/src/cli/spec/machine.rs b/src/cli/spec/machine.rs
+index dc4eefa5..f195b793 100644
+--- a/src/cli/spec/machine.rs
++++ b/src/cli/spec/machine.rs
+@@ -47,8 +47,14 @@ pub(super) fn command() -> Command {
+             ),
+         )
+         .subcommand(profile_command("remove", "Remove a saved SSH machine"))
+-        .subcommand(profile_command("enable", "Enable a saved SSH machine"))
+-        .subcommand(profile_command("disable", "Disable a saved SSH machine"))
++        .subcommand(machine_command("enable", "Enable a saved SSH machine"))
++        .subcommand(machine_command("disable", "Disable a saved SSH machine"))
++}
++
++fn machine_command(name: &'static str, about: &'static str) -> Command {
++    Command::new(name)
++        .about(about)
++        .arg(Arg::new("machine").value_name("LABEL_OR_ID").required(true))
+ }
+ 
+ fn profile_command(name: &'static str, about: &'static str) -> Command {
+diff --git a/src/cli/target.rs b/src/cli/target.rs
+index 9c8b9c80..b2217c48 100644
+--- a/src/cli/target.rs
++++ b/src/cli/target.rs
+@@ -261,25 +261,32 @@ pub(super) fn resolve_machine<'a>(
+     profiles: &'a [SavedSshEndpoint],
+     selector: &str,
+ ) -> Result<&'a SavedSshEndpoint, String> {
+-    let profile = if let Some(profile) = profiles
++    let profile = find_machine(profiles, selector)?;
++    if !profile.enabled {
++        return Err(format!("machine '{selector}' is disabled"));
++    }
++    Ok(profile)
++}
++
++/// Finds a saved machine by profile ID or label, whether or not it is enabled.
++pub(super) fn find_machine<'a>(
++    profiles: &'a [SavedSshEndpoint],
++    selector: &str,
++) -> Result<&'a SavedSshEndpoint, String> {
++    if let Some(profile) = profiles
+         .iter()
+         .find(|profile| profile.id.as_str() == selector)
+     {
+-        profile
+-    } else {
+-        let mut matches = profiles.iter().filter(|profile| profile.label == selector);
+-        let profile = matches
+-            .next()
+-            .ok_or_else(|| format!("unknown machine '{selector}'; use `herdr machine list`"))?;
+-        if matches.next().is_some() {
+-            return Err(format!(
+-                "machine label '{selector}' is ambiguous; use its profile ID"
+-            ));
+-        }
+-        profile
+-    };
+-    if !profile.enabled {
+-        return Err(format!("machine '{selector}' is disabled"));
++        return Ok(profile);
++    }
++    let mut matches = profiles.iter().filter(|profile| profile.label == selector);
++    let profile = matches
++        .next()
++        .ok_or_else(|| format!("unknown machine '{selector}'; use `herdr machine list`"))?;
++    if matches.next().is_some() {
++        return Err(format!(
++            "machine label '{selector}' is ambiguous; use its profile ID"
++        ));
+     }
+     Ok(profile)
+ }
+diff --git a/tests/machine_api.rs b/tests/machine_api.rs
+index a2a9a131..82411e35 100644
+--- a/tests/machine_api.rs
++++ b/tests/machine_api.rs
+@@ -448,6 +448,27 @@ fn machine_remove_deletes_only_that_profiles_metadata() {
+     harness.assert_local_untouched();
+ }
+ 
++#[test]
++fn fork_machine_enable_and_disable_accept_a_label() {
++    let harness = Harness::new();
++    for (action, enabled) in [("disable", false), ("enable", true)] {
++        let output = harness
++            .command(&["machine", action, "mac"])
++            .output()
++            .unwrap();
++        assert!(
++            output.status.success(),
++            "{}",
++            String::from_utf8_lossy(&output.stderr)
++        );
++        let catalog: Value =
++            serde_json::from_slice(&fs::read(harness.state.join("endpoints.json")).unwrap())
++                .unwrap();
++        assert_eq!(catalog["ssh"][0]["enabled"], enabled);
++    }
++    harness.assert_local_untouched();
++}
++
+ #[test]
+ fn machine_api_bad_or_unwritable_metadata_does_not_block_commands() {
+     let harness = Harness::new();

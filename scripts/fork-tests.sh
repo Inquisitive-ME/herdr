@@ -21,3 +21,4 @@ cargo test --locked "$@" --bin herdr -- \
     client::shell::tests::turn_marks:: \
     api::schema::tests::generated_protocol_schema_artifact_is_current
 cargo test --locked "$@" --test cli -- fork_agent_list_filters_by_workspace
+cargo test --locked "$@" --test machine_api -- fork_machine_enable_and_disable_accept_a_label
